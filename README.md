@@ -10,6 +10,7 @@ adaptations for a developer transitioning from one language to another.
 | Move | Guide |
 |---|---|
 | Java → Python | [java-to-python](java-to-python/) |
+| Java → Go | [java-to-golang](java-to-golang/) |
 
 ## Structure
 
