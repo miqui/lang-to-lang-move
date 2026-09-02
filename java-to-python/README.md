@@ -676,6 +676,251 @@ Use a few practical rules:
 - Keep startup composition visible in one place.
 - Document extension and plugin points.
 
+Unlike Java, where Spring (or CDI) is the default choice for dependency injection, Python has no single dominant DI framework. Teams typically use plain constructor injection, or a small library like `dependency-injector`, or a web framework's built-in system (e.g., FastAPI's `Depends`). Pick one pattern deliberately rather than accumulating ad hoc wiring.
+
+---
+
+## 16. “Why didn’t adding a thread speed this up?”
+
+Java threads map to OS threads and can run CPU-bound work in true parallel across cores.
+
+CPython has a Global Interpreter Lock (GIL) that allows only one thread to execute Python bytecode at a time, regardless of core count:
+
+```python
+import threading
+
+def cpu_bound_work() -> int:
+    total = 0
+    for i in range(50_000_000):
+        total += i
+    return total
+
+threads = [threading.Thread(target=cpu_bound_work) for _ in range(4)]
+```
+
+This does not run four times faster on four cores. The GIL serializes bytecode execution across threads.
+
+The practical response depends on the workload:
+
+- Use `threading` for IO-bound work (network calls, file IO) — the GIL is released during blocking IO, so threads still help here.
+- Use `multiprocessing` or `concurrent.futures.ProcessPoolExecutor` for CPU-bound work, at the cost of process-level isolation and serialization overhead between processes.
+- Use `asyncio` for high-concurrency IO-bound workloads, where cooperative scheduling replaces Java's thread-per-request model.
+
+A Java developer used to Java 21's virtual threads — write blocking-style code, get async-style scalability for free — will notice `asyncio` requires explicit `async`/`await` coloring through the whole call stack; there is no equivalent that hides the concurrency model from calling code.
+
+```text
+IO-bound, low concurrency:   threading
+IO-bound, high concurrency:  asyncio
+CPU-bound:                   multiprocessing / ProcessPoolExecutor
+```
+
+---
+
+## 17. “Why did `==` return `False` (or the wrong `True`)?”
+
+Java engineers are trained to reflexively call `.equals()`, because `==` on objects compares references.
+
+Python inverts the default: `==` calls `__eq__`, which many built-in types define as value equality, but a plain user-defined class does not:
+
+```python
+a = [1, 2, 3]
+b = [1, 2, 3]
+a == b   # True — list defines value equality
+a is b   # False — different objects
+
+class Point:
+    def __init__(self, x: int, y: int) -> None:
+        self.x = x
+        self.y = y
+
+p1 = Point(1, 2)
+p2 = Point(1, 2)
+p1 == p2   # False — Point has no __eq__, so identity is used
+```
+
+A Java developer's instinct ("just use `==`, it's not Java's reference `==`") is right for lists, dicts, strings, and numbers, but wrong for a plain custom class — the opposite failure mode from Java's "forgot to override `equals()`."
+
+The practical response:
+
+- `@dataclass` generates `__eq__` automatically (see §12) — prefer it for value objects.
+- Reserve `is` for identity checks that are actually about identity: `is None`, `is True`, sentinel objects, singleton checks.
+- Never use `is` to compare values, even for small integers or short strings — CPython's caching of those is an implementation detail, not a guarantee.
+
+---
+
+## 18. “Why does this list keep growing across unrelated calls?”
+
+```python
+def add_item(item, basket=[]):
+    basket.append(item)
+    return basket
+
+add_item("apple")   # ['apple']
+add_item("banana")  # ['apple', 'banana']  <- shared across every call
+```
+
+Default argument values are evaluated once, at function definition time, not once per call. The same list object is reused on every invocation that doesn't pass `basket` explicitly.
+
+There is no Java equivalent to reach for here — a Java method parameter default (via overloading) is re-evaluated per call, so this behavior has no familiar analog to fall back on.
+
+```python
+def add_item(item: str, basket: list[str] | None = None) -> list[str]:
+    if basket is None:
+        basket = []
+    basket.append(item)
+    return basket
+```
+
+Rule of thumb: never use a mutable literal (`[]`, `{}`, `set()`, or a mutable object) as a default argument value. Use `None` and construct the default inside the function body.
+
+---
+
+## 19. “Why does this import work when I run it one way but not another?”
+
+Java resolves imports against the classpath at compile time, and a package maps directly to a directory structure. A fat/uber JAR bundles everything into one deployable artifact.
+
+Python resolves imports against `sys.path` at runtime, and relative imports behave differently depending on how a module was invoked:
+
+```python
+# app/worker.py
+from . import config
+
+# python -m app.worker   -> works, worker.py is imported as part of the app package
+# python app/worker.py   -> ImportError: attempted relative import with no known parent package
+```
+
+Circular imports are also more common than in Java, because Python executes a module's top-level code the first time it's imported, rather than resolving a full dependency graph up front.
+
+The practical response:
+
+- Run application code as a module (`python -m package.module`) or through a packaged entry point, not as a loose file path.
+- Keep the import graph shallow; break cycles by moving shared types into a leaf module both sides can import.
+- There is no single fat-jar equivalent for deployment — pick one deliberately: a locked `uv`/`pip` install baked into a container image, a `.pyz` zipapp, or a wheel published to a private index.
+
+---
+
+## 20. “How do I overload this method?”
+
+Java lets you define multiple methods with the same name and different parameter types; the compiler picks the right one at the call site.
+
+Python allows only one function definition per name in a given scope — a second `def` silently replaces the first:
+
+```python
+def send(message: str) -> None: ...
+def send(message: str, priority: int) -> None: ...  # this is the only `send` that exists now
+```
+
+The practical response:
+
+- Default and keyword arguments cover most cases:
+
+```python
+def send(message: str, priority: int = 0) -> None: ...
+```
+
+- For genuinely different parameter types, use `functools.singledispatch`:
+
+```python
+from functools import singledispatch
+
+@singledispatch
+def render(value: object) -> str: ...
+
+@render.register
+def _(value: int) -> str:
+    return f"int:{value}"
+
+@render.register
+def _(value: str) -> str:
+    return f"str:{value}"
+```
+
+---
+
+## 21. “Wait, a class can inherit from more than one class?”
+
+Java restricts a class to a single superclass and covers the rest with interfaces. Python permits multiple inheritance directly:
+
+```python
+class Serializable:
+    def to_json(self) -> str: ...
+
+class Timestamped:
+    def touch(self) -> None: ...
+
+class Event(Serializable, Timestamped):
+    pass
+```
+
+Method resolution follows C3 linearization (the "MRO"), not a simple left-to-right search, which can surprise developers used to Java's single-inheritance-plus-interfaces model — especially with `super()` calls in diamond-shaped hierarchies.
+
+```python
+print(Event.__mro__)
+```
+
+The practical response:
+
+- Prefer composition or `Protocol` (§4) over multiple inheritance for anything beyond a simple mixin.
+- If using mixins, keep them stateless and single-purpose, and avoid diamond-shaped or deep hierarchies.
+- Inspect `ClassName.__mro__` when a method's resolution order isn't obvious from reading the class definition.
+
+---
+
+## 22. “Why is deserializing this considered dangerous?”
+
+Java's own default serialization has a well-documented history of deserialization vulnerabilities, so the category isn't unfamiliar — but Python's equivalent is easy to reach for without noticing the risk.
+
+```python
+import pickle
+
+data = pickle.loads(untrusted_bytes)  # can execute arbitrary code during unpickling
+```
+
+`pickle` reconstructs objects by calling constructors and `__reduce__` hooks while deserializing — it is not a safe format for data crossing a trust boundary.
+
+The practical response:
+
+- Never call `pickle.load`/`pickle.loads` on data from a network request, message queue, or user upload.
+- Use `json` or a Pydantic model (§6, §12) for anything crossing a trust boundary.
+- Reserve `pickle` for trusted, internal-only use — e.g., caching an object between processes you control.
+
+---
+
+## 23. “Where is the Javadoc equivalent?”
+
+Java compiles Javadoc comments into browsable HTML API docs as a standard part of the build.
+
+Python's equivalent is docstrings plus a separate documentation generator — there's no single default the way `javadoc` is standard:
+
+```python
+def get_user(user_id: str) -> User:
+    """Fetch a user by id.
+
+    Raises:
+        UserNotFoundError: if no user matches ``user_id``.
+    """
+    ...
+```
+
+The practical response:
+
+- Pick one docstring convention (Google, NumPy, or reST style) and lint it — `ruff`'s `D` rule set enforces docstring presence and format.
+- Generate API docs with `mkdocs` + `mkdocstrings`, or `Sphinx` with `autodoc`, and publish them as part of CI rather than leaving docstrings unread.
+
+---
+
+## What Python Gets Right
+
+The friction above shouldn't read as "Python is worse." Several things are genuinely nicer once a Java engineer settles in:
+
+- No compile step: the edit-run loop is immediate, and a REPL is available for exploring an API or reproducing a bug interactively.
+- `@dataclass` generates `__init__`, `__repr__`, and `__eq__` for free (see §17) — no IDE-generated boilerplate to keep in sync.
+- Comprehensions and built-in `list`/`dict`/`set` operations replace a lot of Java's Stream API ceremony for the common cases.
+- A large, consistent standard library covers most day-to-day tasks without reaching for a dependency.
+- Duck typing and `Protocol` (§4) let you retrofit an interface onto existing code without a refactor — no need to have planned the abstraction in advance.
+
+None of this replaces the discipline this guide argues for — it's why that discipline is worth adding rather than a reason to skip it.
+
 ---
 
 ## Recommended Python Baseline for Java Engineers
@@ -692,7 +937,9 @@ Tests:        pytest
 Validation:   Pydantic at external boundaries
 Models:       dataclasses with frozen=True and slots=True
 Interfaces:   typing.Protocol
-CI:           lint + format check + type check + tests
+Security:     pip-audit for dependency vulnerability scanning
+Docs:         docstrings + mkdocstrings or Sphinx
+CI:           lint + format check + type check + tests + dependency audit
 Containers:   pinned Python base image and reproducible lock-based installs
 ```
 
@@ -715,6 +962,7 @@ dev = [
   "pytest>=8.0",
   "pytest-cov>=5.0",
   "ruff>=0.8",
+  "pip-audit>=2.7",
 ]
 
 [tool.pyright]
@@ -757,6 +1005,7 @@ jobs:
       - run: uv run ruff check .
       - run: uv run pyright
       - run: uv run pytest
+      - run: uv run pip-audit
 ```
 
 ## Bottom Line
