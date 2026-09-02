@@ -1,3 +1,5 @@
+[![Secret Scan](https://github.com/miqui/lang-to-lang-move/actions/workflows/secret-scan.yml/badge.svg)](https://github.com/miqui/lang-to-lang-move/actions/workflows/secret-scan.yml)
+
 # lang-to-lang-move
 
 What to expect when developers move from one language to another.
