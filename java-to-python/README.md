@@ -2,6 +2,8 @@
 
 A Java developer moving to Python will usually complain less about syntax and more about the loss of default guardrails. Python can support highly disciplined, production-grade engineering, but many of the controls Java developers expect are opt-in rather than built into the language and standard workflow.
 
+Most of this applies regardless of which JDK or Python release you're coming from or moving to — it's language design, not a version detail. Where a specific version changes the picture (e.g., virtual threads only exist from JDK 21 on, Python's free-threaded build only became officially supported in 3.14), the relevant section calls it out explicitly rather than assuming a fixed pair of versions.
+
 ## 1. “Why didn’t the compiler catch this?”
 
 This is the largest adjustment.
@@ -684,7 +686,7 @@ Unlike Java, where Spring (or CDI) is the default choice for dependency injectio
 
 Java threads map to OS threads and can run CPU-bound work in true parallel across cores.
 
-CPython has a Global Interpreter Lock (GIL) that allows only one thread to execute Python bytecode at a time, regardless of core count:
+The standard CPython build has a Global Interpreter Lock (GIL) that allows only one thread to execute Python bytecode at a time, regardless of core count:
 
 ```python
 import threading
@@ -698,20 +700,26 @@ def cpu_bound_work() -> int:
 threads = [threading.Thread(target=cpu_bound_work) for _ in range(4)]
 ```
 
-This does not run four times faster on four cores. The GIL serializes bytecode execution across threads.
+On a standard interpreter, this does not run four times faster on four cores — the GIL serializes bytecode execution across threads.
 
-The practical response depends on the workload:
+As of Python 3.14, that's no longer the whole story. PEP 779 makes the free-threaded build (`python3.14t`, built on PEP 703) officially supported — on that build, the GIL is compiled out and `threading` *can* give real CPU-bound parallelism. It's still an opt-in build, not the default `python3.14` interpreter, and most published wheels still assume a GIL is present, so treat it as something to adopt deliberately (verify your dependencies support it) rather than a drop-in replacement.
+
+The practical response, on the default (GIL) build:
 
 - Use `threading` for IO-bound work (network calls, file IO) — the GIL is released during blocking IO, so threads still help here.
 - Use `multiprocessing` or `concurrent.futures.ProcessPoolExecutor` for CPU-bound work, at the cost of process-level isolation and serialization overhead between processes.
 - Use `asyncio` for high-concurrency IO-bound workloads, where cooperative scheduling replaces Java's thread-per-request model.
+- Since 3.14, `concurrent.interpreters` (PEP 734) offers a fourth option: multiple isolated interpreters in one process, each with its own GIL. It gives process-like isolation without the pickling/IPC cost of `multiprocessing` — useful for CPU-bound work that needs isolation but not a separate OS process.
+- On the free-threaded build, `threading` becomes viable for CPU-bound work too, once you've confirmed your dependencies are free-threading-safe.
 
-A Java developer used to Java 21's virtual threads — write blocking-style code, get async-style scalability for free — will notice `asyncio` requires explicit `async`/`await` coloring through the whole call stack; there is no equivalent that hides the concurrency model from calling code.
+A Java developer coming from JDK 21 or later, used to virtual threads — write blocking-style code, get async-style scalability for free — will notice `asyncio` requires explicit `async`/`await` coloring through the whole call stack; there is no equivalent that hides the concurrency model from calling code. (A JDK 17 developer won't have that comparison point at all — virtual threads finalized in JDK 21. And Java's own structured concurrency, the piece that would pair with virtual threads the way `asyncio.TaskGroup` pairs with `asyncio`, is still in preview as of JDK 26 — JEP 525, sixth preview, with finalization expected in JDK 27 — so it isn't a stable comparison to lean on yet either.)
 
 ```text
-IO-bound, low concurrency:   threading
-IO-bound, high concurrency:  asyncio
-CPU-bound:                   multiprocessing / ProcessPoolExecutor
+IO-bound, low concurrency:            threading
+IO-bound, high concurrency:           asyncio
+CPU-bound, process isolation OK:      multiprocessing / ProcessPoolExecutor
+CPU-bound, lighter isolation:         concurrent.interpreters (3.14+)
+CPU-bound, free-threaded build:       threading
 ```
 
 ---
@@ -906,6 +914,62 @@ The practical response:
 
 - Pick one docstring convention (Google, NumPy, or reST style) and lint it — `ruff`'s `D` rule set enforces docstring presence and format.
 - Generate API docs with `mkdocs` + `mkdocstrings`, or `Sphinx` with `autodoc`, and publish them as part of CI rather than leaving docstrings unread.
+
+---
+
+## 24. “Why didn’t it warn me I forgot a case?”
+
+Java developers working with a sealed hierarchy expect the compiler to enforce exhaustiveness. Sealed classes were finalized in JDK 17 and pattern matching for `switch` in JDK 21, so a Java developer on either version reaches for exactly this pattern:
+
+```java
+sealed interface Shape permits Circle, Square {}
+record Circle(double radius) implements Shape {}
+record Square(double side) implements Shape {}
+
+double area(Shape shape) {
+    return switch (shape) {
+        case Circle c -> Math.PI * c.radius() * c.radius();
+        case Square s -> s.side() * s.side();
+        // compiler error if a case is missing
+    };
+}
+```
+
+Python's structural pattern matching (`match`, since 3.10) looks similar but has no compiler behind it:
+
+```python
+def area(shape: Circle | Square) -> float:
+    match shape:
+        case Circle(radius=r):
+            return 3.14159 * r * r
+        case Square(side=s):
+            return s * s
+        # missing a case is a silent None return, not an error
+```
+
+Add a third shape to the union and nothing complains — the function just returns `None` for the case nobody handled.
+
+The practical response is the same static-checking discipline as the rest of this guide, applied to `match`:
+
+```python
+from typing import assert_never
+
+def area(shape: Circle | Square) -> float:
+    match shape:
+        case Circle(radius=r):
+            return 3.14159 * r * r
+        case Square(side=s):
+            return s * s
+        case _:
+            assert_never(shape)  # pyright/mypy flag this if a variant is unhandled
+```
+
+`assert_never` is unreachable at runtime as long as every case is handled; if a new variant is added to the union later without a matching `case`, the type checker (not the language) reports the gap at the `assert_never` call.
+
+Two notes worth keeping current on this specific comparison:
+
+- Python's dataclasses (§12) plus `X | Y` unions map onto sealed records reasonably well, but there's no `permits` clause — anything can subclass a "closed" hierarchy unless you also rely on `@final` (§1) and static checking to catch it.
+- As of JDK 26, Java itself is still extending pattern matching — primitive types in patterns/`instanceof`/`switch` are in a fourth preview (JEP 530) — so the Java side of this comparison is not fully settled either.
 
 ---
 
