@@ -354,6 +354,122 @@ The practical response: don't rely on the compiler to catch a namespace/folder m
 
 ---
 
+## 15. “Why did calling this through the base-class reference get the base's behavior, not the override?”
+
+This is the single biggest inheritance-semantics gap between the two languages, and it's silent — no compile error, often not even a warning if you're not paying attention.
+
+Java makes every instance method virtual by default — dynamic dispatch is the language's default behavior, and you opt *out* of it explicitly with `final`:
+
+```java
+class Animal {
+    public String speak() { return "..."; }
+}
+
+class Dog extends Animal {
+    @Override
+    public String speak() { return "Woof"; }
+}
+
+Animal a = new Dog();
+System.out.println(a.speak()); // "Woof" — always dispatches on the runtime type
+```
+
+C# inverts the default: a method is *not* virtual unless the base class explicitly says so, and a derived class must explicitly write `override` to participate in dynamic dispatch — anything else *hides* the base member instead of overriding it:
+
+```csharp
+class Animal
+{
+    public string Speak() => "..."; // not virtual — an ordinary, non-polymorphic method
+}
+
+class Dog : Animal
+{
+    public new string Speak() => "Woof"; // hides Animal.Speak; does NOT override it
+}
+
+Animal a = new Dog();
+Console.WriteLine(a.Speak()); // "..." — dispatches on the STATIC (compile-time) type, Animal
+
+Dog d = new Dog();
+Console.WriteLine(d.Speak()); // "Woof" — static type is Dog here, so this resolves differently
+```
+
+Two calls on the exact same object return two different results, purely because of the compile-time type of the reference used to call it — something that can't happen in Java, where `a.speak()` and `d.speak()` above would both return `"Woof"` no matter which variable's declared type you called through.
+
+Dropping the `new` keyword on `Dog.Speak()` doesn't fix this — it produces the identical hiding behavior, plus compiler warning CS0108 ("hides inherited member; use the `new` keyword if hiding was intended"). Neither `new` nor its absence makes `Dog.Speak()` participate in polymorphic dispatch — only declaring `Animal.Speak()` as `virtual` and `Dog.Speak()` as `override` does:
+
+```csharp
+class Animal
+{
+    public virtual string Speak() => "...";
+}
+
+class Dog : Animal
+{
+    public override string Speak() => "Woof";
+}
+
+Animal a = new Dog();
+Console.WriteLine(a.Speak()); // "Woof" — now genuinely virtual, matching Java's behavior above
+```
+
+The practical response:
+
+- Mark a base method `virtual` as a deliberate decision that subclasses may change its behavior polymorphically — treat an unmarked method as sealed by default, the opposite assumption from Java's "everything is virtual unless `final`."
+- Never ignore the CS0108 warning — it's the compiler telling you what you wrote looks like an override but isn't one. Add `new` only when hiding is genuinely intended (rare), and `override` (on a `virtual` or `abstract` base member) when polymorphism is the goal.
+- The same rule applies to properties and indexers, not just methods — an unmarked property hides rather than overrides under identical logic.
+- Java's `final` on an overriding method — sealing it against further overriding down the hierarchy — is `sealed override` in C#. A plain method can't be `sealed` on its own; only an `override` can be, since a non-`virtual` method is already unoverridable by default.
+- Covariant return types (an override returning a more derived type than the base declares) work in C# too, but only since C# 9 (.NET 5, 2020) — Java has had this since JDK 5 (2004). If you're reading code written for an older C# target, don't assume it's available.
+
+---
+
+## 16. “Why did the same object answer differently depending on which interface I called it through?”
+
+Java lets a class implement multiple interfaces, but every interface method it implements shares exactly one implementation — if two interfaces declare a method with the same signature, one method body in the class satisfies both. When both interfaces supply conflicting `default` bodies for that signature, Java forces the implementing class to resolve the conflict explicitly, but the resolution is still a single implementation, not two:
+
+```java
+interface Flyer { default String move() { return "Flying"; } }
+interface Swimmer { default String move() { return "Swimming"; } }
+
+class Duck implements Flyer, Swimmer {
+    @Override
+    public String move() { // required: must resolve to one implementation
+        return Flyer.super.move();
+    }
+}
+```
+
+C# allows *explicit interface implementation*, where a class provides a genuinely distinct implementation per interface for a same-named member — and which one runs depends on the static type of the reference used to call it, not on the object's runtime type alone:
+
+```csharp
+interface IFlyer { string Move(); }
+interface ISwimmer { string Move(); }
+
+class Duck : IFlyer, ISwimmer
+{
+    string IFlyer.Move() => "Flying";     // explicit implementation, reachable only via IFlyer
+    string ISwimmer.Move() => "Swimming"; // explicit implementation, reachable only via ISwimmer
+}
+
+Duck duck = new Duck();
+// duck.Move(); // doesn't compile — Move() isn't a public member of Duck itself
+
+IFlyer flyer = duck;
+ISwimmer swimmer = duck;
+Console.WriteLine(flyer.Move());   // "Flying"
+Console.WriteLine(swimmer.Move()); // "Swimming" — same object, different answer
+```
+
+Java has no equivalent to this at all — there's no syntax for a class to give two different bodies for what's nominally "the same method," keyed by which interface reference calls it.
+
+The practical response:
+
+- Use explicit interface implementation to resolve a genuine name collision between two unrelated interfaces a type must implement, or to deliberately de-emphasize a member (a common pattern for `IDisposable.Dispose()`, kept out of a type's "primary" public surface while still satisfying the interface contract).
+- When reading unfamiliar C#, don't assume `someObject.Member` is the only way to reach a given interface member — check whether the type also carries an explicit implementation reachable only by first casting or assigning to the interface type.
+- Don't reach for this as a general technique for giving one type two unrelated behaviors depending on caller perspective — it's a narrow, deliberate escape hatch. If a type genuinely needs two different behaviors, that's usually a sign it's doing two jobs and should be split instead.
+
+---
+
 ## What C# Gets Right
 
 The friction above isn't the whole story — several things are genuinely nicer once a Java engineer settles in:
