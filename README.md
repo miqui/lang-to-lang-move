@@ -15,6 +15,7 @@ adaptations for a developer transitioning from one language to another.
 | Java → Go | [java-to-golang](java-to-golang/) |
 | Java → Node.js | [java-to-nodejs](java-to-nodejs/) |
 | Java → TypeScript | [java-to-typescript](java-to-typescript/) |
+| Java → C# | [java-to-csharp](java-to-csharp/) |
 
 ## Structure
 
