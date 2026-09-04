@@ -121,7 +121,7 @@ The practical response:
 
 ## 5. “Where are checked exceptions — and why doesn't C# have any at all?”
 
-This isn't an oversight — C#'s designers looked at Java's checked exceptions specifically and decided against them. Anders Hejlsberg (C#'s lead architect) has spoken publicly about this being deliberate: checked exceptions in practice pushed Java developers toward `catch (Exception e) {}` or blanket `throws Exception` declarations that defeated the mechanism's own purpose.
+This isn't an oversight — C#'s designers looked at Java's checked exceptions specifically and decided against them.  In practice, checked exceptions pushed Java developers toward `catch (Exception e) {}` or blanket `throws Exception` declarations, which defeated the mechanism's own purpose.
 
 ```csharp
 // no `throws` clause exists in C# at all
