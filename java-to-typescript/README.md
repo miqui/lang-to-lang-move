@@ -409,6 +409,95 @@ The practical response:
 
 ---
 
+## 15. “Why did overriding this method silently do nothing?”
+
+Java's `@Override` annotation is optional, but when present, `javac` actually checks it — annotate a method `@Override` with a signature that doesn't match any base class member, and compilation fails:
+
+```java
+class Animal {
+    String speak() { return "..."; }
+}
+
+class Dog extends Animal {
+    @Override
+    String Speak() { return "Woof"; } // compile error: method does not override a method from its superclass
+}
+```
+
+TypeScript classes dispatch through JavaScript's prototype chain, so a correctly-named method always overrides — but by default, nothing checks that a method you *meant* to override actually matches a base member's name at all:
+
+```typescript
+class Animal {
+  speak(): string { return "..."; }
+}
+
+class Dog extends Animal {
+  Speak(): string { return "Woof"; } // typo'd casing — compiles fine
+}
+
+const d: Animal = new Dog();
+console.log(d.speak()); // "..." — Dog.Speak() is a completely unrelated new method;
+                          // Animal.speak() is still what actually runs
+```
+
+`Dog` now has two unrelated methods — `speak` (inherited) and `Speak` (new) — and the type checker never flags it, because from its point of view you simply added a new method to `Dog`, which is entirely legal.
+
+The practical response:
+
+- Add the `override` keyword (TypeScript 4.3+) to every method meant to override a base member:
+
+```typescript
+class Dog extends Animal {
+  override Speak(): string { return "Woof"; }
+  // error: this member cannot have an 'override' modifier because it is not
+  // declared in the base class 'Animal'
+}
+```
+
+- `override` alone only checks methods you've already remembered to mark — it doesn't require marking them in the first place. Enable `noImplicitOverride: true` in `tsconfig.json` to make the compiler reject an *unmarked* method that happens to match a base signature, closing the gap from the other direction.
+- Together, `override` plus `noImplicitOverride` get you back to roughly what Java's `@Override` gives you — but unlike Java, where `@Override` has been standard practice since Java 5, both are comparatively recent (2021) and easy to find turned off in an existing `tsconfig.json`.
+
+---
+
+## 16. “Where's my multiple inheritance substitute?”
+
+Both languages restrict a class to a single base class. Java's answer for sharing behavior across otherwise-unrelated hierarchies is a `default` method on an interface:
+
+```java
+interface Flyer {
+    default String fly() { return "Flying"; }
+}
+
+class Bird extends Animal implements Flyer { }
+```
+
+TypeScript interfaces are purely structural and erased (§1, §3) — they can't carry a method body at all, so there's no TypeScript equivalent to a Java `default` method. The idiomatic answer to "share behavior across unrelated classes" is instead the mixin pattern: a function that takes a base class and returns a new class extending it:
+
+```typescript
+type Constructor<T = {}> = new (...args: any[]) => T;
+
+function Flyer<TBase extends Constructor>(Base: TBase) {
+  return class extends Base {
+    fly(): string { return "Flying"; }
+  };
+}
+
+class Bird extends Flyer(Animal) { }
+
+const b = new Bird();
+b.fly(); // "Flying" — composed in via the mixin function, not a second base class
+```
+
+This still produces a single, ordinary prototype chain under the hood — `Bird` genuinely has only one runtime base class, the anonymous class the `Flyer` function generated — so it doesn't violate JavaScript's single-inheritance model the way "multiple inheritance" sounds like it should. It's function composition wearing class-declaration syntax.
+
+The practical response:
+
+- Reach for a mixin when several unrelated classes need the same piece of behavior and a shared interface with no implementation isn't enough — the same motivation that would lead a Java developer to a `default` interface method.
+- Keep mixins small and single-purpose, the same discipline this repository's `java-to-golang` guide recommends for struct embedding — a class built from several stacked mixins can become as hard to trace as a deep, ad hoc inheritance chain.
+- Don't reach for a mixin just to avoid writing an interface — if the shared piece is a contract with no shared implementation, a plain `interface` (§1) is simpler and doesn't need the `Constructor` generic boilerplate a mixin requires.
+
+---
+
 ## What TypeScript Gets Right
 
 The friction above isn't the whole story — several things are genuinely nicer once a Java engineer settles in:
