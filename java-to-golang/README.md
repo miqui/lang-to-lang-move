@@ -110,7 +110,18 @@ describe(Dog{Animal{Name: "Rex"}}) // "Rex barks" — interface dispatch, not em
 
 ## 3. “Why didn’t my method mutate the struct?”
 
-Java object fields are always accessed through a reference — a method on an object mutates that object.
+Java object fields are always accessed through a reference — a method on an object mutates that object:
+
+```java
+class Counter {
+    int count;
+    void increment() { count++; }
+}
+
+Counter c = new Counter();
+c.increment();
+System.out.println(c.count); // 1 — increment mutated the shared object
+```
 
 Go structs are value types by default. A method with a value receiver operates on a copy:
 
@@ -192,7 +203,24 @@ var _ Writer = FileLogger{}
 
 ## 5. “Why is this nil check not catching a nil?”
 
-Go's `nil` looks like Java's `null`, until an interface is involved. An interface value is nil only when both its underlying type and value are nil — a nil pointer wrapped in a non-nil interface is itself non-nil:
+Java's `null` is simple: a null reference is null everywhere it's compared, with no wrapping involved:
+
+```java
+class MyError {
+    // ...
+}
+
+MyError doWork() {
+    return null; // no error occurred
+}
+
+MyError err = doWork();
+if (err != null) { // false — a null reference is always null
+    System.out.println("error!");
+}
+```
+
+Go's `nil` looks the same, until an interface is involved. An interface value is nil only when both its underlying type and value are nil — a nil pointer wrapped in a non-nil interface is itself non-nil:
 
 ```go
 type MyError struct{}
@@ -225,7 +253,20 @@ The practical response:
 
 ## 6. “Why does this struct have data I never set?”
 
-Java's `null` at least signals "nothing here yet." Go structs start life fully populated with zero values:
+Java's `null` at least signals "nothing here yet":
+
+```java
+class Config {
+    Duration timeout;
+    int retries;
+    boolean enabled;
+}
+
+Config c = new Config();
+System.out.println(c.timeout); // null — clearly signals "never set"
+```
+
+Go structs start life fully populated with zero values:
 
 ```go
 type Config struct {
@@ -249,6 +290,13 @@ The practical response:
 ---
 
 ## 7. “How do I overload this function?”
+
+Java allows multiple methods with the same name and different parameter types — the compiler resolves which one to call based on the arguments:
+
+```java
+void send(String message) { ... }
+void send(String message, int priority) { ... } // a real overload; the compiler picks based on arguments
+```
 
 Go allows exactly one function or method per name in a scope — no overloading, no default argument values:
 
@@ -288,7 +336,16 @@ It's more ceremony than a Java overload, but it keeps the call site self-documen
 
 ## 8. “Why did modifying this slice change one I never touched?”
 
-Java collections are reference types — slicing isn't a built-in concept the way it is in Go. A Go slice is a view over a backing array, and two slices can share that array without either side being obviously aware of it:
+Java collections are reference types — slicing isn't a built-in concept the way it is in Go, so extracting a range means an explicit copy:
+
+```java
+int[] original = {1, 2, 3, 4, 5};
+int[] sub = Arrays.copyOfRange(original, 1, 3); // {2, 3} — an independent copy, not a view
+sub[0] = 99;
+System.out.println(original[1]); // 2 — untouched, no aliasing possible here
+```
+
+A Go slice is a view over a backing array, and two slices can share that array without either side being obviously aware of it:
 
 ```go
 original := []int{1, 2, 3, 4, 5}
@@ -307,7 +364,19 @@ The practical response:
 
 ## 9. “Why does map iteration print in a different order every run?”
 
-Java's `HashMap` has technically-undefined order too, but it's usually stable within a JVM run, and `LinkedHashMap`/`TreeMap` are available when order matters. Go actively randomizes map iteration order on every run, specifically to stop code from depending on it:
+Java's `HashMap` has technically-undefined order too, but it's usually stable within a JVM run, and `LinkedHashMap`/`TreeMap` are available when order matters:
+
+```java
+Map<String, Integer> m = new LinkedHashMap<>();
+m.put("a", 1);
+m.put("b", 2);
+m.put("c", 3);
+for (var entry : m.entrySet()) {
+    System.out.println(entry.getKey() + " " + entry.getValue()); // same order every run
+}
+```
+
+Go actively randomizes map iteration order on every run, specifically to stop code from depending on it:
 
 ```go
 m := map[string]int{"a": 1, "b": 2, "c": 3}
@@ -329,6 +398,18 @@ sort.Strings(keys)
 ---
 
 ## 10. “Where are try/catch/finally?”
+
+Java handles cleanup and unexpected failures with `try`/`catch`/`finally`, syntactically separating the two concerns:
+
+```java
+try {
+    return doSomething();
+} catch (SomeException e) {
+    throw new RuntimeException("wrapped", e);
+} finally {
+    cleanup(); // always runs, success or failure
+}
+```
 
 Go has `panic`, `recover`, and `defer`, but they aren't a drop-in replacement for Java's exception model — `panic`/`recover` is reserved for programmer errors and truly unrecoverable conditions, not routine failure handling:
 
@@ -360,7 +441,18 @@ The practical response: use `error` returns (§1) for anything an ordinary calle
 
 ## 11. “Why is `private` per-package instead of per-class?”
 
-Java has `private`, `protected`, package-private, and `public`, scoped to the class and hierarchy. Go has exactly one visibility signal — capitalization — scoped to the package, not the type:
+Java has `private`, `protected`, package-private, and `public`, scoped to the class and hierarchy:
+
+```java
+package com.example.user;
+
+public class User {
+    public String id;      // visible everywhere
+    private String email;  // visible only within THIS class, not even other classes in the same package
+}
+```
+
+Go has exactly one visibility signal — capitalization — scoped to the package, not the type:
 
 ```go
 package user
@@ -380,7 +472,19 @@ The practical response: use package boundaries, not type boundaries, to enforce 
 
 ## 12. “Why did my program silently accumulate stuck goroutines?”
 
-Goroutines are cheap, much like Java's virtual threads (JDK 21+) — but Go has no structured-concurrency stdlib equivalent to clean them up automatically (Java's own structured concurrency is itself still in preview as of JDK 26 — JEP 525, sixth preview — so neither ecosystem has fully settled this yet).
+Java's virtual threads (JDK 21+) pair naturally with `try`-with-resources, so a batch of concurrent work has a clear, structured lifetime:
+
+```java
+try (var executor = Executors.newVirtualThreadPerTaskExecutor()) {
+    var futures = urls.stream()
+        .map(url -> executor.submit(() -> fetch(url)))
+        .toList();
+    // the implicit executor.close() blocks until every task finishes or is
+    // cancelled — no task can outlive this block
+}
+```
+
+Goroutines are just as cheap to spawn — but Go has no structured-concurrency stdlib equivalent to clean them up automatically (Java's own structured concurrency is itself still in preview as of JDK 26 — JEP 525, sixth preview — so neither ecosystem has fully settled this yet).
 
 ```go
 func fetchAll(urls []string) []string {
@@ -411,7 +515,19 @@ The practical response:
 
 ## 13. “Generics exist, but why do they feel bolted on?”
 
-Go added generics in 1.18 — much later than Java, and more restricted. There's no operator overloading beyond what a type constraint explicitly permits, no variance, and inference is more limited than Java's:
+Java has had generics, bounded wildcards, and full type inference since Java 5 (2004):
+
+```java
+static double sum(List<? extends Number> values) {
+    double total = 0;
+    for (Number n : values) {
+        total += n.doubleValue(); // works uniformly across Integer, Double, etc.
+    }
+    return total;
+}
+```
+
+Go added generics in 1.18 — much later, and more restricted. There's no operator overloading beyond what a type constraint explicitly permits, no variance, and inference is more limited than Java's:
 
 ```go
 type Number interface {
@@ -433,7 +549,20 @@ The practical response: use generics for container-like utility code (collection
 
 ## 14. “Where's the dependency injection framework?”
 
-Java engineers used to Spring (or CDI) expect a container to wire the application together via annotations and reflection. Go culture actively avoids that kind of magic:
+Java engineers used to Spring (or CDI) expect a container to wire the application together via annotations and reflection:
+
+```java
+@Service
+public class UserService {
+    private final UserRepository userRepo; // injected automatically by the container
+
+    public UserService(UserRepository userRepo) {
+        this.userRepo = userRepo;
+    }
+}
+```
+
+Go culture actively avoids that kind of magic:
 
 ```go
 func main() {
@@ -451,7 +580,16 @@ The practical response: treat explicit constructor wiring in `main()` as the idi
 
 ## 15. “Why does testing feel so manual?”
 
-Java engineers expect JUnit-style assertions and annotations out of the box. Go's standard `testing` package gives you `t.Run` and manual comparisons — nothing more:
+Java engineers expect JUnit-style assertions and annotations out of the box:
+
+```java
+@Test
+void addsTwoPositiveNumbers() {
+    assertEquals(5, Add(2, 3)); // one assertion call, no manual if/Errorf boilerplate
+}
+```
+
+Go's standard `testing` package gives you `t.Run` and manual comparisons — nothing more:
 
 ```go
 func TestAdd(t *testing.T) {
