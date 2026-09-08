@@ -44,6 +44,24 @@ type OrderId = string & { readonly __brand: "OrderId" };
 
 ## 2. “Why did this object literal get rejected, but the exact same object through a variable didn't?”
 
+Java has no equivalent hazard, because interfaces are nominal (§1) — you always explicitly declare which class implements an interface, and extra fields on that class are simply never inspected:
+
+```java
+interface Options {
+    int timeout();
+}
+
+class Config implements Options {
+    public int timeout() { return 5000; }
+    public int retries = 3; // extra field — Java has no concept of "excess" here at all
+}
+
+void configure(Options opts) { ... }
+configure(new Config()); // always fine; extra fields on an implementer are never flagged
+```
+
+TypeScript's structural typing (§1) does try to catch a related mistake, but only in one narrow case:
+
 ```typescript
 interface Options {
   timeout: number;
@@ -66,7 +84,20 @@ The practical response: don't treat a passing type check as proof a typo-laden o
 
 ## 3. “Where did the type go at runtime?”
 
-Java generics are erased too, but Java's non-generic types (`instanceof SomeClass`) survive to runtime because the JVM tracks class identity. TypeScript erases essentially everything type-level, including `interface` and `type` declarations, which have no runtime representation at all:
+Java generics are erased too, but Java's non-generic types (`instanceof SomeClass`) survive to runtime because the JVM tracks class identity:
+
+```java
+class User {
+    String id;
+}
+
+Object obj = new User();
+if (obj instanceof User) { // works fine — the JVM tracks concrete class identity at runtime
+    System.out.println("it's a User");
+}
+```
+
+TypeScript erases essentially everything type-level, including `interface` and `type` declarations, which have no runtime representation at all:
 
 ```typescript
 interface User {
@@ -89,7 +120,14 @@ The practical response:
 
 ## 4. “Why does `unknown` behave differently than `any` — aren't they both ‘could be anything’?”
 
-Java's closest equivalent to "could be anything" is `Object`, which still requires an explicit cast before you can call a specific method on it — the compiler won't let you call `.length()` on an `Object` without casting first.
+Java's closest equivalent to "could be anything" is `Object`, which still requires an explicit cast before you can call a specific method on it — the compiler won't let you call `.length()` on an `Object` without casting first:
+
+```java
+Object payload = fetchPayload();
+payload.length(); // compile error: cannot find symbol — must cast first
+String s = (String) payload; // compiles, but throws ClassCastException at runtime if wrong
+s.length();
+```
 
 TypeScript has two very different "anything" types. `any` disables checking entirely — it behaves like Java's `Object` with the cast already silently applied:
 
@@ -118,7 +156,19 @@ The practical response: default to `unknown` at any boundary where external data
 
 ## 5. “Why did narrowing just stop working?”
 
-Java doesn't have flow-sensitive typing beyond effectively-final local variable capture, so this class of surprise doesn't really exist there — once you've null-checked something in Java, nothing implicit can invalidate that. TypeScript's narrowing is flow-sensitive and looks like it tracks real invariants, but it only reasons about what's visible in the current function body — it can't see through a function call:
+Java doesn't have flow-sensitive typing beyond effectively-final local variable capture, so this class of surprise doesn't really exist there — once you've null-checked something in Java, nothing implicit can invalidate that:
+
+```java
+String name = user.getName();
+if (name != null) {
+    Runnable r = () -> System.out.println(name.toUpperCase());
+    // safe: `name` is captured as an effectively-final local holding the
+    // already-null-checked value — nothing can re-read a changed field later
+    r.run();
+}
+```
+
+TypeScript's narrowing is flow-sensitive and looks like it tracks real invariants, but it only reasons about what's visible in the current function body — it can't see through a function call:
 
 ```typescript
 function process(user: { name: string | null }) {
@@ -149,7 +199,15 @@ if (user.name !== null) {
 
 ## 6. “Are TypeScript `enum`s actually enums?”
 
-Java's `enum` is a closed, type-safe set of singleton instances — you cannot construct an out-of-range value, and switching over one can be checked for exhaustiveness (§9).
+Java's `enum` is a closed, type-safe set of singleton instances — you cannot construct an out-of-range value, and switching over one can be checked for exhaustiveness (§9):
+
+```java
+enum Status { ACTIVE, INACTIVE }
+
+void setStatus(Status s) { ... }
+
+setStatus(99); // compile error: incompatible types — only Status constants are valid
+```
 
 TypeScript's numeric `enum` looks similar but isn't closed:
 
@@ -221,7 +279,16 @@ The practical response:
 
 ## 8. “Why did this ‘immutable’ array get mutated?”
 
-Java's `final` prevents reassigning a variable, but doesn't make the referenced object immutable — a Java developer already knows not to expect deep immutability from `final` alone. TypeScript's `readonly` has the same shallowness, plus it's compile-time only, which adds a second gap Java's `final` doesn't have:
+Java's `final` prevents reassigning a variable, but doesn't make the referenced object immutable — a Java developer already knows not to expect deep immutability from `final` alone:
+
+```java
+final List<String> hosts = new ArrayList<>(List.of("api.example.com"));
+hosts.add("evil.example.com"); // compiles and runs fine — `final` only blocks
+                                 // reassigning the `hosts` variable itself
+System.out.println(hosts); // [api.example.com, evil.example.com]
+```
+
+TypeScript's `readonly` has the same shallowness, plus it's compile-time only, which adds a second gap Java's `final` doesn't have:
 
 ```typescript
 interface Config {
@@ -249,7 +316,21 @@ The practical response:
 
 ## 9. “Where are my sealed types and switch exhaustiveness?”
 
-This is the direct TypeScript analog to [the same question for Java-to-Python movers](../java-to-python/README.md) — Java developers on JDK 17+ (sealed classes) or JDK 21+ (pattern matching for `switch`) expect the compiler to catch a missing case.
+This is the direct TypeScript analog to [the same question for Java-to-Python movers](../java-to-python/README.md) — Java developers on JDK 17+ (sealed classes) or JDK 21+ (pattern matching for `switch`) expect the compiler to catch a missing case:
+
+```java
+sealed interface Shape permits Circle, Square {}
+record Circle(double radius) implements Shape {}
+record Square(double side) implements Shape {}
+
+double area(Shape shape) {
+    return switch (shape) {
+        case Circle c -> Math.PI * c.radius() * c.radius();
+        case Square s -> s.side() * s.side();
+        // compile error if a case is missing — the compiler tracks the permits list
+    };
+}
+```
 
 TypeScript's answer is the discriminated union plus a `never`-based exhaustiveness check, and it's arguably the closest of any language in this repository to what Java 21 gives you natively:
 
@@ -280,7 +361,17 @@ The practical response: treat this pattern — a literal `kind`/`type` discrimin
 
 ## 10. “Why did declaring the same interface twice not error?”
 
-In Java, declaring two types with the same name in the same scope is always a compile error, full stop.
+In Java, declaring two types with the same name in the same scope is always a compile error, full stop:
+
+```java
+interface Window {
+    String title();
+}
+
+interface Window { // compile error: duplicate class: 'Window'
+    int height();
+}
+```
 
 TypeScript `interface` declarations merge automatically when declared more than once in the same scope:
 
@@ -313,7 +404,16 @@ type Window = { height: number }; // error: duplicate identifier 'Window'
 
 ## 11. “How do I even use this — it's plain JavaScript with no types?”
 
-Java has no equivalent problem: a `.jar` either has the class files or it doesn't, and reflection can always inspect them. Most of the JavaScript ecosystem predates TypeScript, and plenty of packages still ship no type information at all.
+Java has no equivalent problem: a `.jar` either has the class files or it doesn't, and reflection can always inspect them — a dependency's type information is baked into the bytecode, never optional metadata that might be missing:
+
+```java
+import com.example.somelibrary.SomeClass;
+
+SomeClass instance = new SomeClass(); // full type info is always available —
+                                        // it's part of the compiled .class file
+```
+
+Most of the JavaScript ecosystem predates TypeScript, and plenty of packages still ship no type information at all:
 
 ```typescript
 import { doSomething } from "some-old-library";
@@ -337,7 +437,14 @@ declare module "some-old-library" {
 
 ## 12. “Why did `as` let something obviously wrong through?”
 
-Java's cast is checked at runtime — casting an `Object` to the wrong type throws `ClassCastException` immediately, at the cast site. TypeScript's `as` is a compile-time-only assertion with no runtime check at all:
+Java's cast is checked at runtime — casting an `Object` to the wrong type throws `ClassCastException` immediately, at the cast site:
+
+```java
+Object input = "not a number";
+Integer value = (Integer) input; // throws ClassCastException immediately, at this line
+```
+
+TypeScript's `as` is a compile-time-only assertion with no runtime check at all:
 
 ```typescript
 const input: unknown = "not a number";
@@ -357,7 +464,15 @@ The practical response:
 
 ## 13. “Decorators look like annotations, but they aren't quite there yet”
 
-Java's `@Annotation` is a single, stable mechanism, backed by reflection, that's been part of the language since Java 5.
+Java's `@Annotation` is a single, stable mechanism, backed by reflection, that's been part of the language since Java 5:
+
+```java
+@Component
+class UserService { }
+
+// reflection can discover every @Component on the classpath at startup
+for (Class<?> c : classpathScanner.findAnnotatedClasses(Component.class)) { ... }
+```
 
 TypeScript decorators have had a longer, messier road: the original `experimentalDecorators` flag (still the default many frameworks — Angular, older NestJS — target) predates the TC39 standard and behaves differently from the standardized decorators TypeScript 5.0 added support for. As of TypeScript 5.9, decorator metadata (`Symbol.metadata`) reached stability, letting frameworks read structured metadata off a decorated class without the `reflect-metadata` polyfill many of them previously required — but plenty of existing code and tutorials still assume that older, `experimentalDecorators` + `reflect-metadata` setup.
 
@@ -382,7 +497,14 @@ The practical response:
 
 ## 14. “Why did this generic function accept a callback with the wrong parameter type?”
 
-Java's generics are invariant by default — a `List<Dog>` is not assignable to a `List<Animal>` parameter, precisely to prevent the kind of unsoundness that would let you insert a `Cat` into what's really a `List<Dog>` through an aliased reference.
+Java's generics are invariant by default — a `List<Dog>` is not assignable to a `List<Animal>` parameter, precisely to prevent the kind of unsoundness that would let you insert a `Cat` into what's really a `List<Dog>` through an aliased reference:
+
+```java
+List<Dog> dogs = new ArrayList<>();
+List<Animal> animals = dogs; // compile error: incompatible types
+                               // (blocked specifically to stop animals.add(new Cat())
+                               // from corrupting what's really a List<Dog>)
+```
 
 TypeScript's structural type system, combined with a historical compatibility decision, allows a real soundness gap specifically for method-shorthand function parameters:
 
@@ -406,6 +528,95 @@ The practical response:
 
 - Prefer the function-property syntax (`handle: (event: T) => void`) over method-shorthand syntax (`handle(event: T): void`) in interfaces and type aliases where parameter safety matters — it opts into the strict check the shorthand form silently skips.
 - Don't assume `strictFunctionTypes` alone closes every parameter-variance hole — it's a real improvement over the pre-2.6 default, but this specific gap is a documented, permanent compatibility exception, not a bug that'll eventually be fixed.
+
+---
+
+## 15. “Why did overriding this method silently do nothing?”
+
+Java's `@Override` annotation is optional, but when present, `javac` actually checks it — annotate a method `@Override` with a signature that doesn't match any base class member, and compilation fails:
+
+```java
+class Animal {
+    String speak() { return "..."; }
+}
+
+class Dog extends Animal {
+    @Override
+    String Speak() { return "Woof"; } // compile error: method does not override a method from its superclass
+}
+```
+
+TypeScript classes dispatch through JavaScript's prototype chain, so a correctly-named method always overrides — but by default, nothing checks that a method you *meant* to override actually matches a base member's name at all:
+
+```typescript
+class Animal {
+  speak(): string { return "..."; }
+}
+
+class Dog extends Animal {
+  Speak(): string { return "Woof"; } // typo'd casing — compiles fine
+}
+
+const d: Animal = new Dog();
+console.log(d.speak()); // "..." — Dog.Speak() is a completely unrelated new method;
+                          // Animal.speak() is still what actually runs
+```
+
+`Dog` now has two unrelated methods — `speak` (inherited) and `Speak` (new) — and the type checker never flags it, because from its point of view you simply added a new method to `Dog`, which is entirely legal.
+
+The practical response:
+
+- Add the `override` keyword (TypeScript 4.3+) to every method meant to override a base member:
+
+```typescript
+class Dog extends Animal {
+  override Speak(): string { return "Woof"; }
+  // error: this member cannot have an 'override' modifier because it is not
+  // declared in the base class 'Animal'
+}
+```
+
+- `override` alone only checks methods you've already remembered to mark — it doesn't require marking them in the first place. Enable `noImplicitOverride: true` in `tsconfig.json` to make the compiler reject an *unmarked* method that happens to match a base signature, closing the gap from the other direction.
+- Together, `override` plus `noImplicitOverride` get you back to roughly what Java's `@Override` gives you — but unlike Java, where `@Override` has been standard practice since Java 5, both are comparatively recent (2021) and easy to find turned off in an existing `tsconfig.json`.
+
+---
+
+## 16. “Where's my multiple inheritance substitute?”
+
+Both languages restrict a class to a single base class. Java's answer for sharing behavior across otherwise-unrelated hierarchies is a `default` method on an interface:
+
+```java
+interface Flyer {
+    default String fly() { return "Flying"; }
+}
+
+class Bird extends Animal implements Flyer { }
+```
+
+TypeScript interfaces are purely structural and erased (§1, §3) — they can't carry a method body at all, so there's no TypeScript equivalent to a Java `default` method. The idiomatic answer to "share behavior across unrelated classes" is instead the mixin pattern: a function that takes a base class and returns a new class extending it:
+
+```typescript
+type Constructor<T = {}> = new (...args: any[]) => T;
+
+function Flyer<TBase extends Constructor>(Base: TBase) {
+  return class extends Base {
+    fly(): string { return "Flying"; }
+  };
+}
+
+class Bird extends Flyer(Animal) { }
+
+const b = new Bird();
+b.fly(); // "Flying" — composed in via the mixin function, not a second base class
+```
+
+This still produces a single, ordinary prototype chain under the hood — `Bird` genuinely has only one runtime base class, the anonymous class the `Flyer` function generated — so it doesn't violate JavaScript's single-inheritance model the way "multiple inheritance" sounds like it should. It's function composition wearing class-declaration syntax.
+
+The practical response:
+
+- Reach for a mixin when several unrelated classes need the same piece of behavior and a shared interface with no implementation isn't enough — the same motivation that would lead a Java developer to a `default` interface method.
+- Keep mixins small and single-purpose, the same discipline this repository's `java-to-golang` guide recommends for struct embedding — a class built from several stacked mixins can become as hard to trace as a deep, ad hoc inheritance chain.
+- Don't reach for a mixin just to avoid writing an interface — if the shared piece is a contract with no shared implementation, a plain `interface` (§1) is simpler and doesn't need the `Constructor` generic boilerplate a mixin requires.
 
 ---
 
