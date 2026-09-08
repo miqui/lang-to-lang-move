@@ -96,7 +96,7 @@ function onUserCreated(user) {
 }
 ```
 
-If `mailer.send` rejects, nothing in this code observes it. Depending on the Node version, an unhandled rejection either logs a warning or crashes the process — either way, the caller who wrote `onUserCreated` has no signal at the call site that something can go wrong.
+If `mailer.send` rejects, nothing in this code observes it. Since Node 15, an unhandled rejection crashes the process by default (`--unhandled-rejections=throw`) rather than just logging a warning — either way, the caller who wrote `onUserCreated` has no signal at the call site that something can go wrong.
 
 The practical response:
 
@@ -386,12 +386,12 @@ import express from "express";
 export { handler };
 ```
 
-A package published as ESM-only cannot be `require()`'d from a CommonJS file — this is the "dual package hazard," and it's a common source of build failures when adding a dependency that made the jump to ESM-only ahead of the rest of a codebase.
+A package published as ESM-only cannot be `require()`'d from a CommonJS file — this is the "dual package hazard," and it's a common source of build failures when adding a dependency that made the jump to ESM-only ahead of the rest of a codebase. (As of Node 22.12+, `require()` can load a synchronous ESM-only module — one with no top-level `await` anywhere in its graph — without a flag; the hazard is narrower than it used to be, but still real for any ESM-only package that does use top-level `await`.)
 
 The practical response:
 
 - For new projects, default to ESM (`"type": "module"` in `package.json`) — it's where the ecosystem and the language spec itself are heading.
-- If a codebase must stay CommonJS, check a new dependency's module format before adding it; an ESM-only package will need a dynamic `import()` (which returns a Promise) rather than a synchronous `require()`.
+- If a codebase must stay CommonJS, check a new dependency's module format before adding it; an ESM-only package will need a dynamic `import()` (which returns a Promise) rather than a synchronous `require()`, unless it qualifies for Node 22.12+'s native `require(esm)` support (no top-level `await`).
 - Don't mix `require` and `import` syntax within the same file — pick one per file, and one system per package unless there's a specific, documented reason for dual-publishing.
 
 ---
@@ -442,7 +442,7 @@ new Date("2024-01-15").getDate(); // can print 14, depending on the machine's lo
 
 The practical response:
 
-- For anything beyond trivial timestamp arithmetic, use a library (`date-fns`, `luxon`) or the newer `Temporal` API where available, rather than the built-in `Date`.
+- For anything beyond trivial timestamp arithmetic, use a library (`date-fns`, `luxon`) or the `Temporal` API rather than the built-in `Date`. `Temporal` isn't available at all on Node 22 LTS (this guide's baseline) — it's reachable only behind `--harmony-temporal` on Node 24, and ships unflagged starting Node 26. Use the `@js-temporal/polyfill` package until your runtime floor moves that far.
 - Store and transmit timestamps as UTC ISO 8601 strings or Unix epoch values; convert to a local timezone only at the presentation layer, mirroring the `Instant` vs `ZonedDateTime` separation in `java.time`.
 - Never rely on the server's local timezone for business logic — set `TZ=UTC` in deployment environments to remove the ambient dependency entirely.
 
@@ -538,6 +538,30 @@ The practical response:
 
 ---
 
+## 16. “Why did one long computation freeze every request, not just the one that triggered it?”
+
+A JVM engineer expects a GC pause to be a local, survivable event: G1 (or ZGC/Shenandoah) mostly collects concurrently with the running program and keeps stop-the-world pauses to single-digit milliseconds — and because the JVM is multi-threaded, other threads keep serving requests while any pause that does happen resolves.
+
+Node.js runs JavaScript on a single thread, and V8's GC runs on that same thread. Its young-generation "Scavenge" collector is fast and mostly unnoticeable, but a major "Mark-Compact" collection is stop-the-world on the only thread available to handle anything else:
+
+```javascript
+function summarize(rows) {
+  return rows.map(r => transform(r)); // builds enough short-lived garbage that
+}                                     // the resulting major GC pause blocks
+                                      // every in-flight request, not just this one
+```
+
+There's no second request-handling thread to fall back on during that pause — a GC pause here is a pause for the entire process, not a pause for one code path.
+
+The practical response:
+
+- Avoid large synchronous allocations or transformations in the hot path; chunk the work, or move it to a `worker_thread` so a major GC pause there doesn't block the main event loop.
+- `--max-old-space-size` caps V8's old-space heap (the rough analog of `-Xmx` for the JVM's old generation), but it only bounds the JS heap — `Buffer`s, `ArrayBuffer`s, and native addon memory sit outside it and won't show up until the process's RSS is already large.
+- Watch for closures and `EventEmitter` listeners that outlive their intended scope — a forgotten `removeListener` or an array accumulating inside a captured callback is the most common source of "leaks" in Node, since nothing else will reclaim a reachable closure.
+- Use `--trace-gc`, `node --inspect` with Chrome DevTools heap snapshots, or `--heapsnapshot-signal` instead of expecting a direct Node equivalent to JVM tools like `jstat` or GC-log analyzers — the tooling and vocabulary (old space/new space, not young/old generation) are V8-specific.
+
+---
+
 ## What Node.js Gets Right
 
 The friction above isn't the whole story — several things are genuinely nicer once a Java engineer settles in:
@@ -562,7 +586,7 @@ Formatting:   Prettier
 Linting:      ESLint + @typescript-eslint (no-floating-promises, eqeqeq, unbound-method)
 Tests:        node:test or Vitest, with coverage thresholds enforced
 Validation:   zod (or equivalent) at external boundaries
-Dates:        date-fns / luxon / Temporal — never bare Date arithmetic
+Dates:        date-fns / luxon / Temporal (needs @js-temporal/polyfill below Node 26) — never bare Date arithmetic
 CI:           lint + typecheck + tests + npm audit
 Containers:   pinned Node base image, multi-stage build, non-root user
 ```

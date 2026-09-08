@@ -304,7 +304,7 @@ var u1 = new User("1", "Miguel", 30);
 var u2 = u1 with { Age = 31 }; // non-destructive copy with one field changed
 ```
 
-The practical response: default to auto-properties (`{ get; set; }`) over manually-backed ones unless you actually need logic in the getter or setter — and reach for `record`/`record struct` for DTOs and value objects the way you'd reach for a Java `record` (JDK 16+), except with the additional `with`-expression non-destructive update Java's own `record` doesn't provide.
+The practical response: default to auto-properties (`{ get; set; }`) over manually-backed ones unless you actually need logic in the getter or setter — and reach for `record` (C# 9+) / `record struct` (C# 10+) for DTOs and value objects the way you'd reach for a Java `record` (JDK 16+), except with the additional `with`-expression non-destructive update Java's own `record` doesn't provide.
 
 ---
 
@@ -467,6 +467,39 @@ The practical response:
 - Use explicit interface implementation to resolve a genuine name collision between two unrelated interfaces a type must implement, or to deliberately de-emphasize a member (a common pattern for `IDisposable.Dispose()`, kept out of a type's "primary" public surface while still satisfying the interface contract).
 - When reading unfamiliar C#, don't assume `someObject.Member` is the only way to reach a given interface member — check whether the type also carries an explicit implementation reachable only by first casting or assigning to the interface type.
 - Don't reach for this as a general technique for giving one type two unrelated behaviors depending on caller perspective — it's a narrow, deliberate escape hatch. If a type genuinely needs two different behaviors, that's usually a sign it's doing two jobs and should be split instead.
+
+---
+
+## 17. “Why did this hot loop start generating garbage the moment I passed the struct through an `object`?”
+
+Every value in Java that isn't a primitive is already a reference type living on the heap, so passing anything into a method that accepts `Object` never allocates beyond ordinary autoboxing of a primitive — and the JIT can often avoid even that for small, cached `Integer` values:
+
+```java
+void log(Object value) { System.out.println(value); }
+log(42); // autoboxes int -> Integer; values -128..127 are cached, so often no fresh allocation
+```
+
+C# structs (§1) are true value types — they live inline, on the stack or embedded within their containing object, specifically to avoid heap allocation and GC involvement. But the moment a struct is converted to `object`, to an interface type, or into a non-generic collection, it's *boxed*: a full heap-allocated copy is made, and that copy is on the GC's books exactly like any class instance.
+
+```csharp
+void Log(object value) => Console.WriteLine(value);
+
+struct Point { public int X, Y; }
+
+Point p = new Point { X = 1, Y = 2 };
+Log(p); // boxes p — a new heap allocation on every call, garbage the moment Log returns
+```
+
+Nothing about the call site `Log(p)` looks like an allocation to someone reading it with Java's uniform-heap model in mind — the type that exists specifically to stay off the heap ends up there anyway, generating Gen0 pressure on every call.
+
+.NET's GC is generational (Gen0/Gen1/Gen2, plus a separate Large Object Heap for allocations ≥ 85,000 bytes) — conceptually closer to the JVM than what most other languages in this repository use — but the defaults and knobs differ.
+
+The practical response:
+
+- Prefer generic APIs and collections (`List<T>`, `IEquatable<T>`, generic constraints) over passing structs through `object` or non-generic types — reified generics (§8) mean a `List<Point>` stores `Point`s unboxed and inline, unlike Java's `List<Integer>`, which always boxes.
+- An interface call site can box silently — implementing the generic form of an interface (`IEquatable<T>` rather than relying on `Equals(object)`, `IComparable<T>` rather than `IComparable`) avoids it; profile with `dotnet-trace` or Visual Studio's allocation profiler if a hot path takes a struct as an interface parameter.
+- Server-side apps (ASP.NET Core's default) run Server GC, background and concurrent by default, tuned for throughput; latency-sensitive desktop-style apps default to Workstation GC. Set `<ServerGarbageCollection>`/`<ConcurrentGarbageCollection>` in the project file deliberately rather than assuming the default matches the workload — the concept maps to choosing a JVM collector, but the knobs and defaults aren't the same ones.
+- Objects ≥ 85,000 bytes land on the Large Object Heap, which historically isn't compacted by default (`GCSettings.LargeObjectHeapCompactionMode` opts in per-collection) — large arrays or buffers in a long-running service can fragment that heap in a way the JVM's compacting collectors wouldn't.
 
 ---
 

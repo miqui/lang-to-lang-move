@@ -620,6 +620,33 @@ The practical response:
 
 ---
 
+## 16. “Why does memory usage keep climbing even though nothing is leaking?”
+
+A Java engineer diagnosing memory growth reaches for a familiar shape: the JVM's generational collector (G1, or ZGC/Shenandoah for low-latency workloads) targets a heap sized by `-Xmx`, and tools like `jstat`, GC logs (`-Xlog:gc`), or VisualVM show a recognizable young/old-generation sawtooth that settles near a target.
+
+Go's GC is a single non-generational mark-sweep collector — there's no young/old split — and it paces itself off `GOGC` (default `100`): by default, it doesn't run again until the live heap has roughly doubled since the last collection.
+
+```go
+// with GOGC=100 (the default), a service holding ~200MB of live objects
+// can let RSS climb toward ~400MB before the next GC cycle even starts —
+// that's the collector pacing itself, not a leak
+func handle(req *Request) {
+    buf := make([]byte, 1<<20) // 1MB per request, short-lived
+    process(buf)
+}
+```
+
+Watched with a JVM mental model, that climb looks exactly like a leak. It isn't — it's `GOGC`'s trigger ratio working as designed, and it settles once the live-heap size stabilizes. (§12 covers the related case where what's actually stuck is a blocked goroutine, not heap memory — Go's GC doesn't reclaim either one until the underlying condition is fixed.)
+
+The practical response:
+
+- Use `GODEBUG=gctrace=1` or `runtime.ReadMemStats`/`go tool pprof` (heap profile) to look at Go's memory picture — the shape of the data is different from JVM GC logs, and pattern-matching against JVM tooling output will mislead you.
+- If RSS growth before collection is a real operational concern (tight container memory limits), lower `GOGC` or set a hard cap with `GOMEMLIMIT` (Go 1.19+) — there's no `-Xmx` equivalent that bounds the heap outright otherwise.
+- Go's heap isn't generational or compacted the way the JVM's old generation is — long-lived and short-lived objects share one heap, so a high allocation rate of small, short-lived objects raises GC CPU cost directly. `sync.Pool` is the idiomatic way to cut that allocation rate in a hot path; there's no automatic young-generation-style win the way a JVM minor GC gives you for free.
+- Use `go build -gcflags="-m"` to see escape analysis decisions — a value that never escapes its function stays on the stack and never touches the GC at all. Reducing unnecessary pointer indirection and boxing into `interface{}` is the direct way to keep allocations off the GC's radar, closer to what the JIT's escape analysis does more transparently in Java.
+
+---
+
 ## What Go Gets Right
 
 The friction above isn't the whole story — several things a Java engineer will genuinely appreciate:
@@ -638,7 +665,7 @@ The friction above isn't the whole story — several things a Java engineer will
 For production backend, API-platform, and cloud services:
 
 ```text
-Go:           Go 1.23+ (or current stable)
+Go:           Go 1.27+ (or current stable)
 Formatting:   gofmt / goimports
 Linting:      golangci-lint (bundles errcheck, staticcheck, govet, gosimple)
 Vet:          go vet

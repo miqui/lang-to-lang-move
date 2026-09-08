@@ -816,7 +816,7 @@ The practical response, on the default (GIL) build:
 - Since 3.14, `concurrent.interpreters` (PEP 734) offers a fourth option: multiple isolated interpreters in one process, each with its own GIL. It gives process-like isolation without the pickling/IPC cost of `multiprocessing` — useful for CPU-bound work that needs isolation but not a separate OS process.
 - On the free-threaded build, `threading` becomes viable for CPU-bound work too, once you've confirmed your dependencies are free-threading-safe.
 
-A Java developer coming from JDK 21 or later, used to virtual threads — write blocking-style code, get async-style scalability for free — will notice `asyncio` requires explicit `async`/`await` coloring through the whole call stack; there is no equivalent that hides the concurrency model from calling code. (A JDK 17 developer won't have that comparison point at all — virtual threads finalized in JDK 21. And Java's own structured concurrency, the piece that would pair with virtual threads the way `asyncio.TaskGroup` pairs with `asyncio`, is still in preview as of JDK 26 — JEP 525, sixth preview, with finalization expected in JDK 27 — so it isn't a stable comparison to lean on yet either.)
+A Java developer coming from JDK 21 or later, used to virtual threads — write blocking-style code, get async-style scalability for free — will notice `asyncio` requires explicit `async`/`await` coloring through the whole call stack; there is no equivalent that hides the concurrency model from calling code. (A JDK 17 developer won't have that comparison point at all — virtual threads finalized in JDK 21. And Java's own structured concurrency, the piece that would pair with virtual threads the way `asyncio.TaskGroup` pairs with `asyncio`, is still in preview as of JDK 27 — JEP 533, seventh preview, with finalization now targeted for JDK 28 — so it isn't a stable comparison to lean on yet either.)
 
 ```text
 IO-bound, low concurrency:            threading
@@ -1131,12 +1131,53 @@ def area(shape: Circle | Square) -> float:
             assert_never(shape)  # pyright/mypy flag this if a variant is unhandled
 ```
 
+`typing.assert_never` requires Python 3.11+ — on 3.10, import it from `typing_extensions` instead (`from typing_extensions import assert_never`).
+
 `assert_never` is unreachable at runtime as long as every case is handled; if a new variant is added to the union later without a matching `case`, the type checker (not the language) reports the gap at the `assert_never` call.
 
 Two notes worth keeping current on this specific comparison:
 
 - Python's dataclasses (§12) plus `X | Y` unions map onto sealed records reasonably well, but there's no `permits` clause — anything can subclass a "closed" hierarchy unless you also rely on `@final` (§1) and static checking to catch it.
-- As of JDK 26, Java itself is still extending pattern matching — primitive types in patterns/`instanceof`/`switch` are in a fourth preview (JEP 530) — so the Java side of this comparison is not fully settled either.
+- As of JDK 27, Java itself is still extending pattern matching — primitive types in patterns/`instanceof`/`switch` are in a fifth preview (JEP 532) — so the Java side of this comparison is not fully settled either.
+
+---
+
+## 25. “Why did this object get cleaned up instantly — and why did that other one never get cleaned up at all?”
+
+Java's GC timing is intentionally unspecified — an object becomes eligible for collection once unreachable, but *when* the collector actually reclaims it is never something a Java program can rely on, which is exactly why `Object.finalize()` was deprecated (JDK 9) and removed outright (JDK 18) in favor of `try`-with-resources/`AutoCloseable`.
+
+CPython's primary reclamation mechanism is reference counting, not a JVM-style tracing collector: an object is freed the instant its refcount hits zero, deterministically, in the same statement that dropped the last reference.
+
+```python
+class Resource:
+    def __del__(self):
+        print("closed")
+
+def use():
+    r = Resource()
+    ...
+    # r's refcount hits zero here — __del__ runs immediately, on CPython
+```
+
+That determinism is real, but it only covers non-cyclic garbage. A reference cycle never hits a refcount of zero on its own, so CPython layers a separate, generational cyclic collector (the `gc` module) on top, purely to find and break cycles — and that part behaves much more like Java's GC: periodic, non-deterministic in exact timing, and pausing to scan.
+
+```python
+class Node:
+    def __init__(self):
+        self.other = None
+
+a, b = Node(), Node()
+a.other, b.other = b, a  # a reference cycle
+del a, b                 # refcounts never reach zero — each is still held by the other;
+                          # reclaimed only whenever the cyclic collector next runs
+```
+
+The practical response:
+
+- Never rely on `__del__` for anything correctness-critical — releasing a lock, flushing a file, closing a socket. Use a context manager (`with`, `contextlib.contextmanager`) instead; that's Python's actual equivalent of `try`-with-resources/`AutoCloseable`, with guaranteed, immediate timing.
+- Don't generalize CPython's immediate refcount-based deallocation to "the language." PyPy and other implementations use a tracing GC with no reference counting at all, so `__del__` timing that looks instantaneous on CPython can be arbitrarily delayed elsewhere.
+- Reference cycles won't leak permanently in CPython — the generational `gc` module collects them — but they defer reclamation and add periodic full-heap scan pauses in a long-running service. Break cycles explicitly (`weakref` for back-references, like a child pointing back to its parent) in hot paths rather than relying on the cyclic collector to catch it eventually.
+- `gc.disable()` is a known trick for shaving latency in short-lived scripts (refcounting alone still frees ordinary garbage without it), but doing that in a long-running server without periodically calling `gc.collect()` lets cyclic garbage accumulate without bound.
 
 ---
 
