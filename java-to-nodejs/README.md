@@ -4,7 +4,19 @@ A Java developer moving to Node.js will usually complain less about the language
 
 ## 1. “Why did one slow request freeze the whole server?”
 
-Java's servlet/thread-per-request model (or virtual threads, JDK 21+) means one slow request occupies its own thread — other requests keep being served by other threads.
+Java's servlet/thread-per-request model (or virtual threads, JDK 21+) means one slow request occupies its own thread — other requests keep being served by other threads:
+
+```java
+@GetMapping("/report")
+String report() {
+    return buildLargeReportSync(); // blocks only this request's own thread
+}
+
+@GetMapping("/health")
+String health() {
+    return "ok"; // served by a different thread — unaffected by /report
+}
+```
 
 Node.js runs application code on a single thread, driven by an event loop. A synchronous, CPU-heavy operation blocks that thread entirely — nothing else runs until it finishes:
 
@@ -32,7 +44,13 @@ The practical response:
 
 ## 2. “Where are my threads?”
 
-Java gives you `Thread`, thread pools, and (since JDK 21) cheap virtual threads for expressing concurrency directly.
+Java gives you `Thread`, thread pools, and (since JDK 21) cheap virtual threads for expressing concurrency directly:
+
+```java
+ExecutorService pool = Executors.newFixedThreadPool(4);
+Future<Result> future = pool.submit(() -> cpuHeavyTask(input));
+Result result = future.get(); // same JVM heap throughout — no copying needed to get it back
+```
 
 Node.js has no equivalent default — JavaScript on the main thread is single-threaded by design. Parallelism exists, but you have to reach for it explicitly:
 
@@ -57,7 +75,15 @@ The practical response:
 
 ## 3. “Why did this promise just disappear?”
 
-Java's checked exceptions force a caller to acknowledge failure at compile time. A rejected Promise with no `.catch()` — or an `async` function called without `await` — fails just as silently as a discarded Go error:
+Java's checked exceptions force a caller to acknowledge failure at compile time:
+
+```java
+void onUserCreated(User user) throws MessagingException {
+    mailer.send(user.getEmail(), "welcome"); // caller must catch this or declare it too
+}
+```
+
+A rejected Promise with no `.catch()` — or an `async` function called without `await` — fails just as silently as a discarded Go error:
 
 ```javascript
 async function sendWelcomeEmail(user) {
@@ -82,7 +108,20 @@ The practical response:
 
 ## 4. “Why is `this` undefined inside my callback?”
 
-In Java, `this` always refers to the instance a method was called on — there's no way to lose it.
+In Java, `this` always refers to the instance a method was called on — there's no way to lose it:
+
+```java
+class UserService {
+    private final Map<String, User> cache = new HashMap<>();
+
+    void handleUser(User user) {
+        cache.put(user.getId(), user); // `this` is always the UserService instance
+    }
+}
+
+UserService service = new UserService();
+eventEmitter.on("user", service::handleUser); // method reference stays bound to `service`
+```
 
 In JavaScript, `this` is determined by how a function is called, not where it's defined. Passing a method as a callback detaches it from its object:
 
@@ -122,6 +161,17 @@ class UserService {
 
 ## 5. “Why did TypeScript let this through?”
 
+Java's static typing is backed by a runtime check the moment a value crosses a type boundary:
+
+```java
+double addTax(double amount) {
+    return amount * 1.07;
+}
+
+Object raw = parseJson(request.getBody());
+addTax((Double) raw); // ClassCastException immediately, right here, if raw isn't actually a Double
+```
+
 TypeScript adds a compile-time type checker Java developers will recognize the shape of — but it's erased entirely by the time code runs:
 
 ```typescript
@@ -146,7 +196,15 @@ The practical response:
 
 ## 6. “Why did `==` say `true` here?”
 
-Java's `==` on primitives is unambiguous, and object comparison always requires `.equals()`. JavaScript's `==` performs type coercion, with rules that are widely considered a design mistake even by the language's own community:
+Java's `==` on primitives is unambiguous, and object comparison always requires `.equals()`:
+
+```java
+0 == 0;                    // true — plain numeric comparison, no coercion involved
+"".equals("0");             // false — String.equals() never coerces between types
+Double.NaN == Double.NaN;  // false — same IEEE 754 rule, but reached only via a type-safe comparison
+```
+
+JavaScript's `==` performs type coercion, with rules that are widely considered a design mistake even by the language's own community:
 
 ```javascript
 0 == "";        // true
@@ -167,7 +225,20 @@ The practical response:
 
 ## 7. “Why is this ‘private’ field visible from outside the class?”
 
-Java's `private` is enforced by the compiler and JVM. JavaScript had no true private state for most of its history — only conventions:
+Java's `private` is enforced by the compiler and JVM:
+
+```java
+class ApiClient {
+    private String apiKey;
+
+    ApiClient(String apiKey) { this.apiKey = apiKey; }
+}
+
+ApiClient client = new ApiClient("secret");
+client.apiKey; // compile error: apiKey has private access in ApiClient
+```
+
+JavaScript had no true private state for most of its history — only conventions:
 
 ```javascript
 class ApiClient {
@@ -205,7 +276,14 @@ The practical response:
 
 ## 8. “Where is my checked exception, and why did this `catch` block get a string?”
 
-Java's `throw` only accepts a `Throwable`. JavaScript's `throw` accepts anything:
+Java's `throw` only accepts a `Throwable`:
+
+```java
+throw "something went wrong"; // compile error: incompatible types: String cannot be converted to Throwable
+throw new RuntimeException("something went wrong"); // the only legal choice, and the only sane one
+```
+
+JavaScript's `throw` accepts anything:
 
 ```javascript
 throw "something went wrong"; // valid
@@ -254,7 +332,16 @@ class UserNotFoundError extends Error {
 
 ## 9. “Which package manager, and which Node, is this project actually using?”
 
-Java engineers usually have one answer (Maven or Gradle) and one JDK, pinned by the build tool. Node.js offers several axes of choice at once:
+Java engineers usually have one answer (Maven or Gradle) and one JDK, pinned by the build tool itself:
+
+```xml
+<properties>
+    <maven.compiler.release>21</maven.compiler.release>
+</properties>
+<!-- one file, one build tool, one pinned JDK version — no axis of choice left open -->
+```
+
+Node.js offers several axes of choice at once:
 
 ```text
 Package managers: npm, yarn, pnpm
@@ -281,7 +368,13 @@ The practical response:
 
 ## 10. “Why did `require` vs `import` break the build?”
 
-Node.js has two module systems in active use: CommonJS (`require`/`module.exports`) and ECMAScript Modules (`import`/`export`). Java's module system (or classpath, pre-JPMS) doesn't have a comparable split within one ecosystem generation.
+Java's module system (or classpath, pre-JPMS) doesn't have a comparable split within one ecosystem generation — there's exactly one way to bring a type into scope:
+
+```java
+import com.example.express.Router; // always resolved via the classpath — one mechanism, one syntax
+```
+
+Node.js has two module systems in active use: CommonJS (`require`/`module.exports`) and ECMAScript Modules (`import`/`export`).
 
 ```javascript
 // CommonJS
@@ -305,7 +398,14 @@ The practical response:
 
 ## 11. “Why isn't `0.1 + 0.2` equal to `0.3`?”
 
-Java has distinct `int`, `long`, `float`, `double`, and `BigDecimal` types, chosen deliberately based on precision needs. JavaScript has exactly one `number` type — an IEEE 754 double — for everything:
+Java has distinct `int`, `long`, `float`, `double`, and `BigDecimal` types, chosen deliberately based on precision needs:
+
+```java
+double sum = 0.1 + 0.2;                                        // 0.30000000000000004 — same IEEE 754 double as JS
+BigDecimal precise = new BigDecimal("0.1").add(new BigDecimal("0.2")); // exactly 0.3, by deliberately opting in
+```
+
+JavaScript has exactly one `number` type — an IEEE 754 double — for everything:
 
 ```javascript
 0.1 + 0.2;               // 0.30000000000000004
@@ -324,7 +424,14 @@ The practical response:
 
 ## 12. “Why did my date roll over to the wrong day?”
 
-Java's `java.time` package (`LocalDate`, `Instant`, `ZonedDateTime`) is deliberately explicit about calendar vs instant vs timezone. JavaScript's built-in `Date` predates that thinking and has several well-known footguns:
+Java's `java.time` package (`LocalDate`, `Instant`, `ZonedDateTime`) is deliberately explicit about calendar vs instant vs timezone:
+
+```java
+LocalDate date = LocalDate.of(2024, 1, 15);              // January is 1, not 0 — no off-by-one trap
+Instant instant = Instant.parse("2024-01-15T00:00:00Z"); // explicitly UTC, no ambient timezone involved
+```
+
+JavaScript's built-in `Date` predates that thinking and has several well-known footguns:
 
 ```javascript
 new Date(2024, 0, 15); // January 15 — the month argument is zero-indexed
@@ -343,7 +450,18 @@ The practical response:
 
 ## 13. “Why did installing one dependency pull in four hundred packages?”
 
-Maven Central has a comparatively high barrier to publishing and a culture of larger, more consolidated libraries. npm has near-zero barrier to publishing, and a culture of small, single-purpose packages composed deeply — a single dependency can pull in a very large transitive tree.
+Maven Central has a comparatively high barrier to publishing and a culture of larger, more consolidated libraries:
+
+```xml
+<dependency>
+    <groupId>org.springframework</groupId>
+    <artifactId>spring-web</artifactId>
+    <version>6.1.0</version>
+</dependency>
+<!-- pulls in a comparatively shallow, well-vetted transitive tree -->
+```
+
+npm has near-zero barrier to publishing, and a culture of small, single-purpose packages composed deeply — a single dependency can pull in a very large transitive tree.
 
 ```bash
 npm install express
@@ -363,7 +481,16 @@ The practical response:
 
 ## 14. “Which test framework is ‘the’ framework?”
 
-Java has one dominant default (JUnit) that nearly every project uses. Node.js has several actively-maintained options with real differences:
+Java has one dominant default (JUnit) that nearly every project uses:
+
+```java
+@Test
+void shouldCalculateTotal() {
+    assertEquals(30, calculateTotal(10, 20)); // JUnit — the only real choice, ecosystem-wide
+}
+```
+
+Node.js has several actively-maintained options with real differences:
 
 ```text
 Jest       — historically dominant, batteries-included, slower on large suites
@@ -381,7 +508,17 @@ The practical response:
 
 ## 15. “Why did extending a built-in type do something unexpected?”
 
-Java's `class` keyword means what it says. JavaScript's `class` is syntactic sugar over prototype-based inheritance, and the underlying prototype chain is mutable at runtime — including for built-in types:
+Java's `class` keyword means what it says — there's no shared, mutable structure sitting behind every instance of a built-in type:
+
+```java
+class ArrayUtils {
+    static <T> T last(List<T> list) { return list.get(list.size() - 1); } // a plain static method
+}
+
+ArrayUtils.last(List.of(1, 2, 3)); // 3 — java.util.List itself is never touched
+```
+
+JavaScript's `class` is syntactic sugar over prototype-based inheritance, and the underlying prototype chain is mutable at runtime — including for built-in types:
 
 ```javascript
 Array.prototype.last = function () {
