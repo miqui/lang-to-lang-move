@@ -190,6 +190,7 @@ The practical response:
 - Use your IDE's "go to definition" rather than assuming a method must be declared on the type itself — extension methods resolve based on which `using` directives are in scope, which is itself a source of surprise (the same call can resolve to a different extension method, or none at all, depending on what's imported).
 - Reach for extension methods yourself for utility functions over a type you don't control, instead of a static helper class with an awkward `StringUtils.isPalindrome(s)` call shape — it's idiomatic C#, not a hack.
 - Keep extension methods discoverable — put them in a namespace/class name that signals what they extend (`StringExtensions`, not a generic `Utils`), since there's no `implements`-style declaration pointing back at the type they augment.
+- C# 14 (.NET 10) generalizes this into *extension members*: an `extension` block can declare extension properties, operators, and static members on the receiver type, not just instance methods. It groups everything extending one type under a single declaration instead of repeating `this T` on each method. Available only from C# 14 — well above this guide's C# 10 floor, so don't expect it in existing code.
 
 ---
 
@@ -211,7 +212,21 @@ T CreateDefault<T>() where T : new() => new T(); // legal, with the `new()` cons
 
 Value-type generics (`List<int>`) also avoid boxing entirely at the CLR level, which has no Java equivalent — `List<Integer>` in Java always boxes every element.
 
-The practical response: this is one of the areas where C# is simply less surprising than Java, not more — code that "should obviously work" (checking a generic type at runtime, creating a new instance of a type parameter, storing value types in a generic collection without boxing overhead) generally does. The one adjustment: `where T : new()` only allows a parameterless constructor call — for anything more, pass a factory `Func<T>` instead, since C# still won't let you call an arbitrary constructor generically.
+Reification also enables something Java has no answer to at all. Java can't express "a generic method that sums any numeric type" — `Number` has no `+`, so you end up with an overload per primitive. C# 11 (.NET 7) added static abstract interface members, and the BCL's `INumber<TSelf>` builds generic math on top of them:
+
+```csharp
+static T Sum<T>(IEnumerable<T> values) where T : INumber<T>
+{
+    T total = T.Zero;              // a static member, resolved through the type parameter
+    foreach (var v in values) total += v;
+    return total;
+}
+
+Sum(new[] { 1, 2, 3 });        // int
+Sum(new[] { 1.5, 2.5 });       // double — one implementation, no overloads
+```
+
+The practical response: this is one of the areas where C# is simply less surprising than Java, not more — code that "should obviously work" (checking a generic type at runtime, creating a new instance of a type parameter, storing value types in a generic collection without boxing overhead) generally does. The one adjustment: `where T : new()` only allows a parameterless constructor call — for anything more, pass a factory `Func<T>` instead, since C# still won't let you call an arbitrary constructor generically. And note that generic math needs C# 11 / .NET 7 or later — above this guide's C# 10 floor, so it won't be available in every codebase you touch.
 
 ---
 
@@ -304,7 +319,22 @@ var u1 = new User("1", "Miguel", 30);
 var u2 = u1 with { Age = 31 }; // non-destructive copy with one field changed
 ```
 
-The practical response: default to auto-properties (`{ get; set; }`) over manually-backed ones unless you actually need logic in the getter or setter — and reach for `record` (C# 9+) / `record struct` (C# 10+) for DTOs and value objects the way you'd reach for a Java `record` (JDK 16+), except with the additional `with`-expression non-destructive update Java's own `record` doesn't provide.
+Object initializers make this construction style pleasant but historically unsafe — nothing forced a caller to set anything, which is why Java developers reach for a builder. `required` (C# 11, .NET 7) closes that gap at the compiler level:
+
+```csharp
+public class User
+{
+    public required string Id { get; init; }   // caller MUST set this
+    public required string Name { get; init; }
+    public int Age { get; init; }               // optional
+}
+
+var u = new User { Id = "1" }; // compile error: required member 'Name' must be set
+```
+
+The practical response: default to auto-properties (`{ get; set; }`) over manually-backed ones unless you actually need logic in the getter or setter — and reach for `record` (C# 9+) / `record struct` (C# 10+) for DTOs and value objects the way you'd reach for a Java `record` (JDK 16+), except with the additional `with`-expression non-destructive update Java's own `record` doesn't provide. Where you'd write a Java builder purely to make construction safe, `required` members (C# 11+) usually replace it outright.
+
+One place Java got there first: multi-line string boilerplate. Java text blocks (`"""`) finalized in JDK 15 (JEP 378); C#'s raw string literals — same `"""` delimiter, same goal of embedding JSON/SQL/XML without escaping — arrived in C# 11 (.NET 7), two years later. If you're on the C# 10 floor, you're still writing verbatim strings (`@"..."`) with doubled quotes.
 
 ---
 
@@ -500,6 +530,112 @@ The practical response:
 - An interface call site can box silently — implementing the generic form of an interface (`IEquatable<T>` rather than relying on `Equals(object)`, `IComparable<T>` rather than `IComparable`) avoids it; profile with `dotnet-trace` or Visual Studio's allocation profiler if a hot path takes a struct as an interface parameter.
 - Server-side apps (ASP.NET Core's default) run Server GC, background and concurrent by default, tuned for throughput; latency-sensitive desktop-style apps default to Workstation GC. Set `<ServerGarbageCollection>`/`<ConcurrentGarbageCollection>` in the project file deliberately rather than assuming the default matches the workload — the concept maps to choosing a JVM collector, but the knobs and defaults aren't the same ones.
 - Objects ≥ 85,000 bytes land on the Large Object Heap, which historically isn't compacted by default (`GCSettings.LargeObjectHeapCompactionMode` opts in per-collection) — large arrays or buffers in a long-running service can fragment that heap in a way the JVM's compacting collectors wouldn't.
+
+---
+
+## 18. “Why doesn't this primary constructor act like a record?”
+
+A Java `record` declaration generates a great deal from one line — accessors, value equality, `hashCode`, and a `toString`:
+
+```java
+public record Person(String name, int age) { }
+
+var p1 = new Person("Miguel", 30);
+var p2 = new Person("Miguel", 30);
+p1.equals(p2);   // true — value equality, generated
+p1.name();       // "Miguel" — accessor, generated
+p1.toString();   // "Person[name=Miguel, age=30]", generated
+```
+
+C# primary constructors (C# 12, .NET 8) let a `class` or `struct` declare constructor parameters in the header, which reads almost identically — and generates almost none of that:
+
+```csharp
+public class Person(string name, int age)
+{
+    public string Describe() => $"{name} is {age}"; // params stay in scope for the whole class body
+}
+
+var p1 = new Person("Miguel", 30);
+var p2 = new Person("Miguel", 30);
+Console.WriteLine(p1 == p2);       // False — reference equality; no == is generated
+// Console.WriteLine(p1.Name);     // doesn't compile — no property is generated
+Console.WriteLine(p1.ToString());  // "Person" — the default, not a value-based ToString
+```
+
+The parameters become captured private fields, not properties: nothing is exposed publicly, no equality or `ToString` is generated, and there's no deconstruction. Worse for a Java reader's assumptions, those captured parameters are ordinary mutable state in scope for the entire class body — any method can reassign `name`, and it stays reassigned. C#'s actual analog of a Java `record` is a C# `record` (§12), which does generate init-only properties, value equality, `ToString`, and deconstruction.
+
+The practical response:
+
+- Read `class Foo(...)` as "constructor parameters that never go out of scope," not as a record declaration. If you want Java-record semantics, write `record Foo(...)` (C# 9+) or `record struct Foo(...)` (C# 10+).
+- If callers need to read a primary constructor parameter, declare the property explicitly (`public string Name { get; } = name;`) — the parameter alone gives you nothing public.
+- Treat a captured parameter as mutable unless you deliberately assign it to a `readonly` field; a Java developer expecting record-component immutability won't get it here.
+- The same syntax on a `struct` (C# 12) likewise generates no value equality beyond what §1 and §2 describe for structs generally — the header shape is not a signal about equality in either case.
+
+---
+
+## 19. “Where's my zero-copy slice?”
+
+Slicing in Java allocates. `substring` has produced a fresh `String` with its own backing array since JDK 7u6, and `split` allocates both an array and a `String` per element:
+
+```java
+String csv = "alpha,beta,gamma";
+String[] parts = csv.split(",");     // allocates an array plus a String per element
+String first = csv.substring(0, 5);  // allocates a new String with its own char[]
+```
+
+Java's zero-copy tools are separate APIs you opt into — `ByteBuffer`, or the Foreign Function & Memory API finalized in JDK 22 (JEP 454) — not something the language threads through ordinary code.
+
+C# has `Span<T>`/`ReadOnlySpan<T>`: stack-only views over contiguous memory that slice without allocating at all.
+
+```csharp
+ReadOnlySpan<char> csv = "alpha,beta,gamma";
+ReadOnlySpan<char> first = csv.Slice(0, 5); // no allocation — a view over the same memory
+Span<byte> buffer = stackalloc byte[256];   // stack-allocated; the GC never sees it
+```
+
+These are `ref struct` types, and that's the direct counterweight to §17: where boxing pushes a value type onto the GC's books, a `Span<T>` guarantees it never gets there. The cost is a set of restrictions that feel arbitrary until you see the reason — a `ref struct` can't be a field of a `class` or non-ref struct, can't be boxed, and can't be captured in a lambda or local function. All of it follows from one rule: these types hold managed interior pointers, and the GC only tracks those on the stack. C# 13 (.NET 9) softened two of the sharpest edges — a `ref struct` can now implement an interface (though still never be converted to one, since that would box), the `allows ref struct` anti-constraint lets one be used as a generic type argument, and they're permitted in async methods and iterators as long as they don't sit in the same block as an `await` or a `yield return`.
+
+The practical response:
+
+- Reach for `ReadOnlySpan<char>` over `Substring` in parsing and formatting hot paths — not allocating is the entire point, and most of the BCL's parsing surface (`int.Parse`, `Utf8Formatter`, etc.) has span overloads.
+- Use `stackalloc` for small, short-lived buffers only — stay well under about 1KB, since blowing the stack is a process-ending failure, not an exception you can catch.
+- Expect the restrictions to bite in ordinary code: no stashing a `Span<T>` in a field, no closing over it, no holding it across an `await`. That's not an arbitrary limitation — it's what makes the stack-only guarantee sound.
+- Don't spread it everywhere. `Span<T>` earns its complexity in parsers, serializers, and buffer-shuffling code; in ordinary business logic it buys nothing and costs readability.
+
+---
+
+## 20. “Why did this arithmetic throw instead of wrapping?”
+
+Java's rule for integer overflow is absolute and stated in the language spec: it wraps, silently, always. The opt-in to loud failure is a library call:
+
+```java
+int max = Integer.MAX_VALUE;
+int wrapped = max + 1;                // -2147483648 — silently wraps, by language rule
+int loud = Math.addExact(max, 1);     // ArithmeticException — the explicit opt-in
+```
+
+C# wraps by default too — but "by default" is doing real work in that sentence, because the default is a project-level setting:
+
+```csharp
+int max = int.MaxValue;
+int wrapped = max + 1;         // wraps — unless the project sets CheckForOverflowUnderflow
+
+checked
+{
+    int boom = max + 1;        // OverflowException
+}
+
+int constant = int.MaxValue + 1; // compile ERROR — constant expressions are always checked
+```
+
+The same expression can wrap in one project and throw in another, decided by `<CheckForOverflowUnderflow>` in the `.csproj` rather than by anything visible at the call site. Constant expressions are checked at compile time regardless of that setting. And since C# 11, a user-defined operator can supply a separate `checked` variant, so a custom type's `+` may genuinely do two different things depending on the context it's called from.
+
+The practical response:
+
+- Don't carry Java's "overflow always wraps silently" assumption into an unfamiliar C# codebase — check `<CheckForOverflowUnderflow>` before reasoning about arithmetic.
+- Turn checking on for financial or domain code where a silent wrap is a correctness bug, and use an explicit `unchecked { }` block for the narrow cases where wrapping is intended (hash computation being the classic one).
+- Note that `decimal` throws on overflow regardless of the surrounding context, and floating-point types never throw at all — they produce `Infinity`/`NaN`, matching Java. The configurable behavior applies to the integral types.
+- If you define arithmetic operators on your own type (§13), consider supplying the `checked operator` variant (C# 11+) so the type stays consistent in both contexts rather than silently wrapping inside a `checked` block.
 
 ---
 
