@@ -8,7 +8,17 @@ Most of this applies regardless of which JDK or Python release you're coming fro
 
 This is the largest adjustment.
 
-Java has a compile-time-enforced static type system. If a method expects a `BigDecimal`, passing a `String` is a compiler error. In Python, type annotations are not enforced by the runtime.
+Java has a compile-time-enforced static type system. If a method expects a `BigDecimal`, passing a `String` is a compiler error:
+
+```java
+BigDecimal addTax(BigDecimal amount) {
+    return amount.multiply(new BigDecimal("1.07"));
+}
+
+addTax("100"); // compile error: incompatible types: String cannot be converted to BigDecimal
+```
+
+In Python, type annotations are not enforced by the runtime.
 
 ```python
 def add_tax(amount: float) -> float:
@@ -51,6 +61,14 @@ The key mindset is:
 
 ## 2. “Why are type hints optional?”
 
+Java gives you no equivalent laxity — a method signature is always fully typed, with no way to omit an annotation:
+
+```java
+User getUser(String userId) { // parameter and return types are never optional
+    ...
+}
+```
+
 Python supports type hints:
 
 ```python
@@ -86,7 +104,13 @@ A well-run Python service should establish a clear policy:
 
 ## 3. “Why is `Any` allowed to destroy the type system?”
 
-In Java, type escapes usually look explicit: raw generics, unchecked casts, reflection, or `Object`.
+In Java, type escapes usually look explicit: raw generics, unchecked casts, reflection, or `Object`:
+
+```java
+Object payload = fetchPayload();
+
+int userId = (int) payload; // ClassCastException at the cast site if the assumption is wrong
+```
 
 In Python, `Any` can quietly disable static safety:
 
@@ -232,7 +256,16 @@ For a production Python package:
 
 ## 6. “Why can an object change shape at runtime?”
 
-In Java, an object’s fields and methods are generally fixed by its class definition.
+In Java, an object’s fields and methods are generally fixed by its class definition:
+
+```java
+class User {
+    String name;
+}
+
+User user = new User();
+user.permissions = List.of("admin"); // compile error: cannot find symbol
+```
 
 In Python, code can attach attributes dynamically:
 
@@ -355,7 +388,15 @@ except UserNotFoundError:
 
 ## 8. “Why does `None` blow up later?”
 
-Java developers are familiar with `null`, `Optional<T>`, and `NullPointerException`.
+Java developers are familiar with `null`, `Optional<T>`, and `NullPointerException`:
+
+```java
+Optional<User> findUser(String userId) { ... }
+
+User user = findUser("123").get(); // throws NoSuchElementException if empty — still an unchecked
+                                     // failure, but Optional<T> at least makes "might be absent"
+                                     // visible in the signature
+```
 
 Python has `None`:
 
@@ -410,6 +451,19 @@ Java engineers usually know the answer:
 - Maven.
 - Gradle.
 
+```xml
+<!-- pom.xml — one dependency file format, one build lifecycle -->
+<project>
+  <dependencies>
+    <dependency>
+      <groupId>com.example</groupId>
+      <artifactId>some-library</artifactId>
+      <version>1.2.3</version>
+    </dependency>
+  </dependencies>
+</project>
+```
+
 Python developers may offer:
 
 - `pip`
@@ -460,7 +514,12 @@ python -m pip
 python3 -m pip
 ```
 
-A Java developer expects the project build tool to select the JDK and dependency graph predictably.
+A Java developer expects the project build tool to select the JDK and dependency graph predictably:
+
+```bash
+mvn -version    # reports exactly which JDK Maven resolved and is using
+./gradlew -version
+```
 
 Python requires explicit environment discipline:
 
@@ -499,6 +558,12 @@ Java refactoring benefits from:
 - Explicit interfaces.
 - Static dependency structures.
 - Build failures for many incompatible changes.
+
+```java
+// renaming or removing this method fails the build immediately, at every call site,
+// before a single test runs
+public User getUser(String userId) { ... }
+```
 
 Python refactoring is safe when a team invests in the safety net:
 
@@ -543,7 +608,11 @@ user["email"] = 42
 user["unknown_flag"] = True
 ```
 
-Java developers may immediately ask for a class.
+Java developers may immediately ask for a class:
+
+```java
+record User(String id, String email, List<String> roles) {}
+```
 
 Use `TypedDict` for lightweight dictionary structures:
 
@@ -593,7 +662,17 @@ def process(item) -> None:
     item.execute()
 ```
 
-This is powerful, but a Java developer expects either an interface or a generic bound.
+This is powerful, but a Java developer expects either an interface or a generic bound:
+
+```java
+interface Executable {
+    void execute();
+}
+
+void process(Executable item) {
+    item.execute();
+}
+```
 
 Use a protocol:
 
@@ -619,6 +698,13 @@ This gives you:
 ---
 
 ## 14. “Why does this test double work but production fail?”
+
+Java's own mocking frameworks (Mockito, and similar) are interface-based, so a mock fails to compile the moment the interface it's mocking changes:
+
+```java
+Executable client = mock(Executable.class);
+doNothing().when(client).execute(); // fails to COMPILE if execute()'s signature ever changes
+```
 
 Python makes mocking easy because objects and functions can be replaced dynamically.
 
@@ -666,7 +752,18 @@ Examples include:
 - Framework configuration through global state.
 - Plugin discovery through package metadata.
 
-This can feel opaque to developers accustomed to explicit Java configuration and dependency injection.
+This can feel opaque to developers accustomed to explicit Java configuration and dependency injection:
+
+```java
+@Service
+public class UserService {
+    private final UserRepository repository;
+
+    public UserService(UserRepository repository) { // constructor injection, wired at startup
+        this.repository = repository;
+    }
+}
+```
 
 Use a few practical rules:
 
@@ -684,7 +781,14 @@ Unlike Java, where Spring (or CDI) is the default choice for dependency injectio
 
 ## 16. “Why didn’t adding a thread speed this up?”
 
-Java threads map to OS threads and can run CPU-bound work in true parallel across cores.
+Java threads map to OS threads and can run CPU-bound work in true parallel across cores:
+
+```java
+Thread t1 = new Thread(UserService::cpuBoundWork);
+Thread t2 = new Thread(UserService::cpuBoundWork);
+t1.start();
+t2.start(); // genuinely runs in parallel on separate cores
+```
 
 The standard CPython build has a Global Interpreter Lock (GIL) that allows only one thread to execute Python bytecode at a time, regardless of core count:
 
@@ -726,7 +830,20 @@ CPU-bound, free-threaded build:       threading
 
 ## 17. “Why did `==` return `False` (or the wrong `True`)?”
 
-Java engineers are trained to reflexively call `.equals()`, because `==` on objects compares references.
+Java engineers are trained to reflexively call `.equals()`, because `==` on objects compares references:
+
+```java
+List<Integer> a = List.of(1, 2, 3);
+List<Integer> b = List.of(1, 2, 3);
+a.equals(b); // true — List.equals() defines value equality
+a == b;      // false — reference equality, as always
+
+class Point { int x, y; }
+
+Point p1 = new Point();
+Point p2 = new Point();
+p1.equals(p2); // false — Object.equals() defaults to reference equality unless overridden
+```
 
 Python inverts the default: `==` calls `__eq__`, which many built-in types define as value equality, but a plain user-defined class does not:
 
@@ -769,7 +886,18 @@ add_item("banana")  # ['apple', 'banana']  <- shared across every call
 
 Default argument values are evaluated once, at function definition time, not once per call. The same list object is reused on every invocation that doesn't pass `basket` explicitly.
 
-There is no Java equivalent to reach for here — a Java method parameter default (via overloading) is re-evaluated per call, so this behavior has no familiar analog to fall back on.
+There is no Java equivalent to reach for here — a Java method parameter default (via overloading) is re-evaluated per call, so this behavior has no familiar analog to fall back on:
+
+```java
+List<String> addItem(String item, List<String> basket) {
+    basket.add(item);
+    return basket;
+}
+
+List<String> addItem(String item) {
+    return addItem(item, new ArrayList<>()); // a fresh list, constructed fresh on every call
+}
+```
 
 ```python
 def add_item(item: str, basket: list[str] | None = None) -> list[str]:
@@ -785,7 +913,14 @@ Rule of thumb: never use a mutable literal (`[]`, `{}`, `set()`, or a mutable ob
 
 ## 19. “Why does this import work when I run it one way but not another?”
 
-Java resolves imports against the classpath at compile time, and a package maps directly to a directory structure. A fat/uber JAR bundles everything into one deployable artifact.
+Java resolves imports against the classpath at compile time, and a package maps directly to a directory structure. A fat/uber JAR bundles everything into one deployable artifact:
+
+```java
+package com.example.app;
+
+import com.example.app.config.Config; // resolved against the classpath at compile time,
+                                        // identically regardless of how the JVM was invoked
+```
 
 Python resolves imports against `sys.path` at runtime, and relative imports behave differently depending on how a module was invoked:
 
@@ -809,7 +944,12 @@ The practical response:
 
 ## 20. “How do I overload this method?”
 
-Java lets you define multiple methods with the same name and different parameter types; the compiler picks the right one at the call site.
+Java lets you define multiple methods with the same name and different parameter types; the compiler picks the right one at the call site:
+
+```java
+void send(String message) { ... }
+void send(String message, int priority) { ... } // the compiler picks the right one at each call site
+```
 
 Python allows only one function definition per name in a given scope — a second `def` silently replaces the first:
 
@@ -847,7 +987,15 @@ def _(value: str) -> str:
 
 ## 21. “Wait, a class can inherit from more than one class?”
 
-Java restricts a class to a single superclass and covers the rest with interfaces. Python permits multiple inheritance directly:
+Java restricts a class to a single superclass and covers the rest with interfaces:
+
+```java
+class Event implements Serializable, Timestamped { // multiple interfaces, one superclass only
+    ...
+}
+```
+
+Python permits multiple inheritance directly:
 
 ```python
 class Serializable:
@@ -876,7 +1024,15 @@ The practical response:
 
 ## 22. “Why is deserializing this considered dangerous?”
 
-Java's own default serialization has a well-documented history of deserialization vulnerabilities, so the category isn't unfamiliar — but Python's equivalent is easy to reach for without noticing the risk.
+Java's own default serialization has a well-documented history of deserialization vulnerabilities, so the category isn't unfamiliar:
+
+```java
+ObjectInputStream in = new ObjectInputStream(untrustedStream);
+Object data = in.readObject(); // can execute arbitrary code during deserialization —
+                                 // the same class of risk CVE-driven guidance warns against
+```
+
+Python's equivalent is easy to reach for without noticing the risk.
 
 ```python
 import pickle
@@ -896,7 +1052,18 @@ The practical response:
 
 ## 23. “Where is the Javadoc equivalent?”
 
-Java compiles Javadoc comments into browsable HTML API docs as a standard part of the build.
+Java compiles Javadoc comments into browsable HTML API docs as a standard part of the build:
+
+```java
+/**
+ * Fetch a user by id.
+ *
+ * @param userId the user's id
+ * @return the matching user
+ * @throws UserNotFoundException if no user matches {@code userId}
+ */
+User getUser(String userId) { ... }
+```
 
 Python's equivalent is docstrings plus a separate documentation generator — there's no single default the way `javadoc` is standard:
 
