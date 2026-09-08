@@ -103,6 +103,7 @@ The practical response:
 - Treat every `async` function call as something that must be `await`ed, `.catch()`ed, or explicitly and visibly fired-and-forgotten (`void sendWelcomeEmail(user)` in TypeScript documents the intent).
 - Lint for it — `@typescript-eslint/no-floating-promises` catches exactly this class of bug at build time.
 - Register a top-level `process.on("unhandledRejection", ...)` handler as a safety net, not as the primary handling strategy.
+- For work that should be abandoned rather than awaited — a superseded query, a request past its deadline — use `AbortController`/`AbortSignal` (a global since Node 15) and pass the signal into `fetch`, timers, and stream APIs. It's the closest thing to `Future.cancel(true)`, and like Java's interruption it's cooperative: the callee has to actually check the signal.
 
 ---
 
@@ -328,6 +329,16 @@ class UserNotFoundError extends Error {
 }
 ```
 
+- Chain errors with the ES2022 `cause` option (Node 16.9+) instead of concatenating context into a new message — it's the direct analog of `new RuntimeException("...", e)`, and it preserves the original error and its stack rather than flattening it to a string:
+
+```javascript
+} catch (err) {
+  throw new Error(`Failed to load user ${id}`, { cause: err });
+}
+```
+
+- `cause` only preserves something if what you caught was an `Error` to begin with — a thrown string has no stack to keep, which is the same reason the first rule above matters.
+
 ---
 
 ## 9. “Which package manager, and which Node, is this project actually using?”
@@ -359,10 +370,12 @@ The practical response:
 
 ```json
 {
-  "engines": { "node": ">=22.0.0" },
+  "engines": { "node": ">=24.0.0" },
   "packageManager": "npm@10.9.0"
 }
 ```
+
+- Note that `packageManager` is Corepack's pinning mechanism, and Corepack's own status moved: it is no longer distributed with Node 25 and later, though it remains bundled in Node 24 LTS and earlier. If a workflow depends on it, install it explicitly (`npm install -g corepack`) rather than assuming the runtime ships with it.
 
 ---
 
@@ -442,7 +455,7 @@ new Date("2024-01-15").getDate(); // can print 14, depending on the machine's lo
 
 The practical response:
 
-- For anything beyond trivial timestamp arithmetic, use a library (`date-fns`, `luxon`) or the `Temporal` API rather than the built-in `Date`. `Temporal` isn't available at all on Node 22 LTS (this guide's baseline) — it's reachable only behind `--harmony-temporal` on Node 24, and ships unflagged starting Node 26. Use the `@js-temporal/polyfill` package until your runtime floor moves that far.
+- For anything beyond trivial timestamp arithmetic, use a library (`date-fns`, `luxon`) or the `Temporal` API rather than the built-in `Date`. `Temporal` isn't available at all on Node 22 (this guide's floor) — it's reachable only behind `--harmony-temporal` on Node 24, and ships unflagged starting Node 26. Use the `@js-temporal/polyfill` package until your runtime floor moves that far.
 - Store and transmit timestamps as UTC ISO 8601 strings or Unix epoch values; convert to a local timezone only at the presentation layer, mirroring the `Instant` vs `ZonedDateTime` separation in `java.time`.
 - Never rely on the server's local timezone for business logic — set `TZ=UTC` in deployment environments to remove the ambient dependency entirely.
 
@@ -473,6 +486,7 @@ Every package in that tree is code that runs at install time (via lifecycle scri
 The practical response:
 
 - Run `npm audit` (or `pnpm audit`) in CI, and treat high-severity findings as build failures, the same way a Java team would treat an OWASP dependency-check failure.
+- Check whether the runtime already covers it before adding a package at all. `fetch` (stable since Node 21) replaces axios and node-fetch, `node --watch` (stable since Node 21) replaces nodemon, `--env-file` (added in Node 20.6, no longer experimental as of 22.21) replaces dotenv, and `node:test` (§14) replaces the test-framework dependency outright. Several of the reflexive "every Node project needs these" packages are now redundant.
 - Review new dependencies before adding them — package size, maintenance activity, and transitive dependency count are all visible on the npm registry page before you commit to one.
 - Consider disabling install-time lifecycle scripts for third-party packages (`npm install --ignore-scripts`, or pnpm's default-deny) when the added risk isn't worth the convenience.
 - Commit the lockfile and treat any lockfile diff in a PR as something to actually read, not skip past.
@@ -490,18 +504,30 @@ void shouldCalculateTotal() {
 }
 ```
 
-Node.js has several actively-maintained options with real differences:
+Node.js now ships a runner in the runtime itself — `node:test` plus `node:assert`, stable since Node 20, invoked with `node --test`:
+
+```javascript
+import test from "node:test";
+import assert from "node:assert/strict";
+
+test("calculates total", () => {
+  assert.equal(calculateTotal(10, 20), 30); // no install, no config, no dependency
+});
+```
+
+That answers "where's my JUnit" more directly than anything Node had before, but it hasn't displaced the ecosystem — most existing projects, and most tutorials and tooling you'll encounter, still assume Jest or Vitest:
 
 ```text
 Jest       — historically dominant, batteries-included, slower on large suites
 Vitest     — fast, Vite-native, Jest-compatible API
 Mocha+Chai — older, more assembly required
-node:test  — built into Node itself since v18, no dependency required
+node:test  — built in, stable since Node 20, zero dependencies, thinner feature surface
 ```
 
 The practical response:
 
 - For a new project with no existing constraint, `node:test` (built-in, zero dependency) or Vitest (fast, good TypeScript support) are the current pragmatic defaults — pick one and standardize it across the team rather than letting it vary by contributor preference.
+- Don't assume the built-in runner is a drop-in for Jest. Mocking, snapshot testing, and the richer matcher library are where it's deliberately thinner — which is exactly where a team used to JUnit plus Mockito and AssertJ will feel the gap.
 - Whichever framework is chosen, enforce coverage thresholds in CI the way a Java team would with JaCoCo, rather than leaving coverage advisory-only.
 
 ---
@@ -562,6 +588,73 @@ The practical response:
 
 ---
 
+## 17. “Where do I put the request context — there's no thread to hang it on?”
+
+In Java, request-scoped context lives in a `ThreadLocal`. Because a request owns its thread for its whole lifetime, every layer underneath can read that context without being handed it explicitly — SLF4J's MDC is the most familiar instance:
+
+```java
+MDC.put("correlationId", request.getHeader("X-Correlation-Id"));
+try {
+    orderService.process(order); // nothing below takes correlationId as a parameter
+} finally {
+    MDC.remove("correlationId"); // the logger reads it off the thread automatically
+}
+```
+
+Node has no thread to attach that to — one thread interleaves every in-flight request, so a module-level variable is shared by all of them, and the naive version leaks one request's identity into another's logs. `AsyncLocalStorage` (stable since Node 16.4) is the real equivalent: it keeps a store alive across the async continuations spawned inside `run()`.
+
+```javascript
+import { AsyncLocalStorage } from "node:async_hooks";
+
+const requestContext = new AsyncLocalStorage();
+
+app.use((req, res, next) => {
+  requestContext.run({ correlationId: req.get("X-Correlation-Id") }, next);
+});
+
+// anywhere further down the await chain, with no parameter threaded through:
+const { correlationId } = requestContext.getStore() ?? {};
+```
+
+The store follows `await` and native promise chains, so it survives the boundaries a `ThreadLocal` survives in Java — but it's scoped per async context rather than per thread, and it's the only supported way to get this behavior.
+
+The practical response:
+
+- Set the store once at the edge (HTTP middleware, a queue consumer's message handler) and read it wherever you'd have read the MDC. Don't thread a context object through every function signature, and never use a module-level variable — it's shared across concurrent requests.
+- Wire it into the logger rather than reading it by hand at each call site; that's what makes it an actual MDC replacement rather than a global with extra steps.
+- Expect context loss around older callback-style APIs and custom thenables — Node's own documentation calls this out. `util.promisify()` on a callback API, or `AsyncResource` for a custom thenable, restores propagation.
+- It isn't free. Maintaining the store across async boundaries costs more than passing a parameter would, so scope it to context genuinely needed for the whole request (correlation ID, tenant, authenticated user), not as a general-purpose ambient store.
+
+---
+
+## 18. “Wait — do I still need a build step for TypeScript?”
+
+A Java developer treats the compile step as the thing that catches mistakes: `javac` produces the artifact and enforces the types in one pass, and there's no mode in which you get a runnable class file whose types went unchecked.
+
+```java
+String total = calculateTotal(10, 20); // compile error: int cannot be converted to String
+// no class file is produced — code that fails to typecheck cannot be run
+```
+
+Node runs TypeScript files directly now, with no build step and no `ts-node`:
+
+```javascript
+// server.ts — run it with: node server.ts
+function addTax(amount: number): number {
+  return amount * 1.07;
+}
+```
+
+This is *type stripping*: Node erases the annotations and runs the JavaScript underneath. It arrived behind `--experimental-strip-types` in Node 22.6 and runs unflagged from Node 22.18 and 23.6 onward. The part that matters most coming from Java is what it doesn't do — it never type-checks. Annotations are deleted, not verified, so a file that `tsc` would reject runs perfectly happily.
+
+The practical response:
+
+- Keep `tsc --noEmit` in CI and in your editor. `node server.ts` replaces the build step, not the type checker — nothing else will tell you the types are wrong.
+- Type stripping only handles *erasable* syntax. Enums, namespaces containing runtime code, and constructor parameter properties have to generate JavaScript rather than be deleted, so Node rejects them outright with `ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX` — see [java-to-typescript](../java-to-typescript/) for why `enum` in particular is a poor fit.
+- On the Node 22 line, check the minor version before relying on flagless execution: 22.18+ runs `.ts` directly, earlier 22.x still needs `--experimental-strip-types`.
+
+---
+
 ## What Node.js Gets Right
 
 The friction above isn't the whole story — several things are genuinely nicer once a Java engineer settles in:
@@ -579,7 +672,7 @@ The friction above isn't the whole story — several things are genuinely nicer 
 For production backend and API services:
 
 ```text
-Runtime:      Node.js 22+ LTS
+Runtime:      Node.js 24+ LTS (24 is Active LTS; 22 dropped to maintenance in Oct 2025)
 Language:     TypeScript, strict mode
 Packages:     npm (or pnpm) + committed lockfile
 Formatting:   Prettier
@@ -627,7 +720,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: "22"
+          node-version: "24"
           cache: "npm"
 
       - run: npm ci

@@ -42,6 +42,7 @@ The practical response:
 - Lint for it — `errcheck` (bundled in `golangci-lint`) flags ignored errors.
 - Wrap errors with context using `%w`, and use `errors.Is`/`errors.As` for callers that need to branch on error identity.
 - Define sentinel errors (`var ErrNotFound = errors.New(...)`) or custom error types for conditions callers are expected to handle.
+- To report several independent failures at once — validating every field rather than bailing on the first — use `errors.Join` (Go 1.20+), or multiple `%w` verbs in one `fmt.Errorf`. It's the rough analog of Java's suppressed exceptions, and `errors.Is`/`errors.As` see through the whole set.
 
 ---
 
@@ -484,15 +485,15 @@ try (var executor = Executors.newVirtualThreadPerTaskExecutor()) {
 }
 ```
 
-Goroutines are just as cheap to spawn — but Go has no structured-concurrency stdlib equivalent to clean them up automatically (Java's own structured concurrency is itself still in preview as of JDK 26 — JEP 525, sixth preview — so neither ecosystem has fully settled this yet).
+Goroutines are just as cheap to spawn — but Go has no structured-concurrency stdlib equivalent to clean them up automatically (Java's own structured concurrency is itself still in preview as of JDK 27 — JEP 533, seventh preview, with finalization targeted for JDK 28 — so neither ecosystem has fully settled this yet).
 
 ```go
 func fetchAll(urls []string) []string {
     results := make(chan string)
     for _, url := range urls {
-        go func(u string) {
-            results <- fetch(u) // blocks forever if nobody ever reads
-        }(url)
+        go func() {
+            results <- fetch(url) // blocks forever if nobody ever reads
+        }()
     }
     out := make([]string, 0, len(urls))
     for range urls {
@@ -503,6 +504,8 @@ func fetchAll(urls []string) []string {
 ```
 
 If the caller returns early — say, on the first error — before draining `results`, every remaining goroutine blocks on its send forever. No crash, no error, just a goroutine that never gets garbage collected because Go's GC doesn't reclaim blocked goroutines.
+
+One thing to know when reading older Go: capturing `url` directly is only safe as written from Go 1.22 on. Before that, a `for` loop reused one variable across all iterations, so every goroutine saw whichever value the loop had reached by the time it ran — the same aliasing bug Java avoids by requiring captured locals to be effectively final. That's why older code and most StackOverflow answers pass the value as a parameter (`go func(u string) {...}(url)`) or re-declare it (`url := url`); neither is needed anymore. The new semantics are keyed to the `go` directive in `go.mod`, not the toolchain version, so a module still declaring `go 1.21` or lower keeps the old behavior even when built with a current Go.
 
 The practical response:
 
@@ -574,7 +577,10 @@ func main() {
 }
 ```
 
-The practical response: treat explicit constructor wiring in `main()` as the idiomatic default, not a workaround. If wiring grows unwieldy, `google/wire` generates equivalent code at compile time from a small set of provider functions — it removes the boilerplate without introducing a runtime reflection-based container.
+The practical response:
+
+- Treat explicit constructor wiring in `main()` as the idiomatic default, not a workaround. If wiring grows unwieldy, `google/wire` generates equivalent code at compile time from a small set of provider functions — it removes the boilerplate without introducing a runtime reflection-based container.
+- The same "no framework" instinct applies to routing, and the stdlib answer got materially better in Go 1.22: `net/http.ServeMux` patterns now match on method and capture path wildcards (`mux.HandleFunc("GET /users/{id}", h)`, read back with `r.PathValue("id")`), returning `405` on a method mismatch automatically. It's the closest stdlib equivalent to Spring MVC's `@GetMapping`, and it makes "reach for `chi`/`gorilla/mux` by default" advice written before 1.22 worth re-examining.
 
 ---
 
@@ -617,6 +623,7 @@ The practical response:
 
 - Add `testify`'s `assert`/`require` if the team wants assertion helpers, but decide deliberately — some teams skip it intentionally so failures read as plain Go control flow.
 - Generate mocks from interfaces with `mockgen` (`gomock`) rather than hand-rolling them; because interfaces are structural (§4), a hand-written fake struct is often simpler than a mock in the first place.
+- For concurrent code, use `testing/synctest` (experimental under `GOEXPERIMENT=synctest` in Go 1.24, generally available in 1.25+) instead of sleeping and hoping. `synctest.Test` runs a test inside a bubble with a virtualized clock that jumps forward the moment every goroutine is blocked, which makes timeout and retry logic deterministic — the job a Java engineer would hand to Awaitility, minus the polling.
 
 ---
 
@@ -644,6 +651,85 @@ The practical response:
 - If RSS growth before collection is a real operational concern (tight container memory limits), lower `GOGC` or set a hard cap with `GOMEMLIMIT` (Go 1.19+) — there's no `-Xmx` equivalent that bounds the heap outright otherwise.
 - Go's heap isn't generational or compacted the way the JVM's old generation is — long-lived and short-lived objects share one heap, so a high allocation rate of small, short-lived objects raises GC CPU cost directly. `sync.Pool` is the idiomatic way to cut that allocation rate in a hot path; there's no automatic young-generation-style win the way a JVM minor GC gives you for free.
 - Use `go build -gcflags="-m"` to see escape analysis decisions — a value that never escapes its function stays on the stack and never touches the GC at all. Reducing unnecessary pointer indirection and boxing into `interface{}` is the direct way to keep allocations off the GC's radar, closer to what the JIT's escape analysis does more transparently in Java.
+- Check the runtime's CPU view separately from its memory view, because `GOMAXPROCS` only became container-aware in Go 1.25. On Linux it now defaults to the cgroup CPU bandwidth limit when that's lower than the visible core count, and re-reads it if the limit changes. Before 1.25 it saw host cores, so a Go service pinned to 2 CPUs on a 64-core node ran a 64-way runtime — the exact failure the JVM's `UseContainerSupport` has handled by default since JDK 10, and one a Java engineer will reasonably assume Go had solved already.
+- The collector itself is also a moving target: the "Green Tea" GC, available as an experiment in Go 1.25 (`GOEXPERIMENT=greenteagc`), became the default in Go 1.26. It improves marking and scanning locality for small objects rather than changing the `GOGC` pacing model above, so the mental model in this section still holds — but GC-overhead numbers measured on an older release won't carry over.
+
+---
+
+## 17. “Where is the Stream API?”
+
+Java engineers reach for `Stream` the moment a transformation has more than one step, and the chain reads as a single declarative expression:
+
+```java
+List<String> emails = users.stream()
+    .filter(User::isActive)
+    .map(User::getEmail)
+    .sorted()
+    .toList();
+```
+
+Go has no equivalent, and the idiomatic answer is a plain loop:
+
+```go
+var emails []string
+for _, u := range users {
+    if u.Active {
+        emails = append(emails, u.Email)
+    }
+}
+slices.Sort(emails) // slices/maps packages: Go 1.21+
+```
+
+That's more lines, and Go's culture treats that as the correct trade — an explicit loop has no hidden allocation, no lazy-evaluation semantics to reason about, and no question of whether it runs in parallel. There is no `.parallelStream()` analog either; concurrency is something you write with goroutines and a channel or `errgroup`, deliberately (§12).
+
+Two additions narrow the gap without closing it. The `slices` and `maps` packages (Go 1.21+) cover the common terminal operations — `slices.Sort`, `slices.Contains`, `slices.Max`, `maps.Keys` — and range-over-func iterators (Go 1.23+) let a function be ranged over directly, which is what makes composable, lazy pipelines expressible at all:
+
+```go
+// iter.Seq[V] is just func(yield func(V) bool) — Go 1.23+
+func Filter[V any](seq iter.Seq[V], keep func(V) bool) iter.Seq[V] {
+    return func(yield func(V) bool) {
+        for v := range seq {
+            if keep(v) && !yield(v) {
+                return
+            }
+        }
+    }
+}
+```
+
+The practical response:
+
+- Write the loop. For most transformations it's shorter than the generic-pipeline machinery needed to avoid it, and it's what a Go reviewer expects to see.
+- Use `slices`/`maps` (Go 1.21+) for the operations they already cover rather than hand-rolling a sort or a search.
+- Treat iterators (Go 1.23+) as worth knowing but not yet ambient: they're stdlib, but much of the ecosystem predates them and still exposes slices and callbacks, so a codebase-wide pipeline style is not something you can assume collaborators share. There is no `Collectors`-style library the community has standardized on.
+
+---
+
+## 18. “Where's my logging facade?”
+
+A Java service almost always logs through SLF4J, with the implementation chosen separately at deploy time, and per-request context carried implicitly in MDC:
+
+```java
+private static final Logger log = LoggerFactory.getLogger(UserService.class);
+
+MDC.put("requestId", requestId);       // ambient, thread-local
+log.info("user created id={}", userId); // SLF4J facade; Logback/Log4j2 does the work
+```
+
+Go's standard library grew a structured logger in 1.21, `log/slog`, which collapses the facade/implementation split into one package — `slog.Logger` is the API, `slog.Handler` is the pluggable backend:
+
+```go
+logger := slog.New(slog.NewJSONHandler(os.Stdout, nil)) // Go 1.21+
+logger.Info("user created", "userID", userID, "requestID", requestID)
+```
+
+The part that doesn't transfer is MDC. Go has no thread-local storage — and deliberately so, since a goroutine has no stable identity to key one on — so there's nothing that implicitly tags every log line in a request with its correlation ID.
+
+The practical response:
+
+- Use `log/slog` (Go 1.21+) for new code rather than `zap` or `zerolog` by reflex; the third-party loggers still win on raw throughput, but stdlib means libraries can log through the same interface without your dependency tree agreeing on one.
+- Replace MDC by putting a `*slog.Logger` (already decorated via `logger.With("requestID", id)`) into the request's `context.Context`, and pulling it back out where you log. It's explicit plumbing where Java gives you ambient state — the same trade as §14's stance on dependency injection.
+- Prefer the `slog.InfoContext`-style calls that take a `context.Context`, so a custom `Handler` can extract trace or tenant fields from the context itself — that's the closest structural equivalent to MDC, and it requires writing the handler.
 
 ---
 
@@ -671,6 +757,8 @@ Linting:      golangci-lint (bundles errcheck, staticcheck, govet, gosimple)
 Vet:          go vet
 Tests:        go test -race -cover
 Modules:      go.mod + go.sum, committed
+Logging:      log/slog (stdlib), JSON handler in production
+Routing:      net/http.ServeMux (method + wildcard patterns, Go 1.22+)
 Wiring:       explicit constructors in main(), or google/wire if generated
 Mocking:      mockgen (gomock) from interfaces
 CI:           format check + vet + lint + race-enabled tests
@@ -682,7 +770,7 @@ Example `go.mod`:
 ```text
 module github.com/org/api-service
 
-go 1.23
+go 1.27
 
 require (
 	github.com/google/uuid v1.6.0
@@ -710,7 +798,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.23"
+          go-version: "1.27"
 
       - run: gofmt -l . | tee /dev/stderr | (! grep .)
       - run: go vet ./...

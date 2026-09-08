@@ -115,6 +115,7 @@ The practical response:
 
 - Use a runtime-checkable construct when you need a real runtime check: a `class` (which does compile to something `instanceof`-checkable), a discriminated union with a literal tag field (§9), or a schema validator (`zod`) that both validates and infers the static type from one definition.
 - Treat `interface`/`type` as compiler-only documentation — never write code that assumes they exist once the file is compiled to JavaScript.
+- The erasure is near-total, which is a useful mental model: delete every piece of type syntax and you generally have working JavaScript. The exceptions are `enum`, `namespace`, and constructor parameter properties, which emit real runtime code — see §6, and `--erasableSyntaxOnly` (TypeScript 5.8+) for enforcing the rule.
 
 ---
 
@@ -240,6 +241,14 @@ If you need an actual object grouping the values (for iteration, or a value-to-l
 const Status = { Active: "active", Inactive: "inactive" } as const;
 type Status = (typeof Status)[keyof typeof Status];
 ```
+
+There's now a second, harder reason to avoid `enum`. Almost everything in TypeScript is *erasable* — deleting the type syntax leaves valid JavaScript with identical behavior (§3). Three constructs aren't: `enum`, `namespace`, and constructor parameter properties (`constructor(private db: Database)`) all emit real runtime code. That makes them incompatible with runtimes that strip types rather than compile them, which is what Node's native TypeScript execution does — see [java-to-nodejs](../java-to-nodejs/) for that side of it. TypeScript 5.8 added `--erasableSyntaxOnly`, which makes using any of the three a compile error:
+
+```json
+{ "compilerOptions": { "erasableSyntaxOnly": true } }
+```
+
+For a Java developer this is the reverse of the usual intuition: the constructs that look *most* like their Java counterparts — a real `enum`, a `namespace` resembling a package, constructor parameter properties resembling a concise constructor — are exactly the ones that aren't really part of the type layer at all.
 
 ---
 
@@ -459,6 +468,19 @@ The practical response:
 - Treat `as` as an unchecked, unverified promise to the compiler, not a runtime-safe cast — use it only when you have external certainty the type is correct (a value you constructed yourself, or one already validated by a schema library upstream).
 - Avoid the "double assertion" escape hatch (`value as unknown as Target`), which exists specifically to bypass TypeScript's own sanity check that the source and target types overlap at all — if you need it, that's a strong signal the value should be validated at runtime instead of asserted.
 - For parsing external input, use a schema library that performs a real runtime check and only then narrows the type (`zod`'s `.parse()`), rather than casting a `JSON.parse()` result and hoping.
+- When `as` is being used merely to check a value against a shape — not to override the compiler — reach for `satisfies` (TypeScript 4.9+) instead. It verifies the expression matches the target type without widening the inferred type to it, so you keep the precise literal types and still get the error when the shape is wrong:
+
+```typescript
+const config = {
+  port: 8080,
+  host: "localhost",
+} satisfies Record<string, string | number>;
+
+config.port.toFixed();  // still `number`, not `string | number` — inference preserved
+config.hsot;            // error: typo caught, unlike `as Record<...>` which would hide it
+```
+
+There's no Java equivalent — a Java type annotation always widens the variable to the declared type, so "check it against this contract but keep the specific type" isn't expressible.
 
 ---
 
@@ -620,6 +642,87 @@ The practical response:
 
 ---
 
+## 17. “Where's my try-with-resources?”
+
+Java has had `try`-with-resources since Java 7, and it's the default way to guarantee cleanup — any `AutoCloseable` is closed at the end of the block, in reverse declaration order, even if the body throws:
+
+```java
+try (var conn = dataSource.getConnection();
+     var stmt = conn.prepareStatement(SQL)) {
+    return stmt.executeQuery();
+} // stmt.close() then conn.close(), guaranteed — and if close() itself throws,
+  // that exception is attached to the primary one via getSuppressed()
+```
+
+TypeScript 5.2 added `using` and `await using` declarations, which do the same job with a different shape — disposal is tied to the enclosing scope, so there's no extra block to introduce:
+
+```typescript
+function query(sql: string) {
+  using conn = pool.getConnection();  // conn[Symbol.dispose]() runs when scope exits
+  using stmt = conn.prepare(sql);
+  return stmt.execute();
+} // stmt disposed, then conn — reverse order, even if execute() throws
+```
+
+A "resource" is any object with a `[Symbol.dispose]()` method. `await using` looks for `[Symbol.asyncDispose]()` and awaits it — something Java has no equivalent to at all, since `AutoCloseable.close()` has no asynchronous counterpart.
+
+This isn't a TypeScript-only construct: the TC39 explicit resource management proposal reached Stage 4 in May 2025 and is part of ES2026. Runtime support is newer than the TypeScript support, though — V8 shipped it in Chrome 134, and Node gained native support in Node 24 — the runtime [java-to-nodejs](../java-to-nodejs/) recommends. On Node 22, which that guide treats as its floor, the `Symbol.dispose` symbols exist but the syntax isn't parsed natively; TypeScript downlevels it for you.
+
+The practical response:
+
+- Reach for `using` anywhere you'd write `try`-with-resources in Java — file handles, connections, spans, locks, test fixtures — and `await using` where cleanup is itself asynchronous.
+- Set `lib` appropriately (the `esnext.disposable` / ES2026 lib types) so `Disposable` and `AsyncDisposable` resolve; a missing lib entry is the usual cause of "`Symbol.dispose` does not exist."
+- Use `DisposableStack`/`AsyncDisposableStack` when disposal is conditional or accumulated at runtime rather than one-resource-per-declaration — the case Java handles by nesting or by manual `finally`.
+- Expect `SuppressedError` where Java gives you `getSuppressed()`: if a disposal throws while another error is already propagating, JavaScript wraps both rather than attaching one to the other.
+
+---
+
+## 18. “Where are my bounded wildcards?”
+
+Java's generics are invariant, and use-site wildcards are how you opt out of that, one parameter at a time — the PECS rule every Java developer internalizes:
+
+```java
+// producer-extends: read Numbers out of a List of any subtype
+double sum(List<? extends Number> values) { ... }
+
+// consumer-super: write Integers into any List that can hold them
+void fill(List<? super Integer> target) { ... }
+
+sum(new ArrayList<Integer>());  // fine
+fill(new ArrayList<Number>());  // fine
+```
+
+TypeScript has no use-site variance at all — no `? extends`, no `? super`. Variance is structural, inferred from how a type parameter is actually used, and assignability just follows from that:
+
+```typescript
+function sum(values: readonly number[]): number { ... }
+
+declare const dogs: Dog[];
+const animals: Animal[] = dogs; // allowed — arrays are covariant, and unsoundly so
+animals.push(new Cat());         // compiles; `dogs` now contains a Cat
+```
+
+A Java developer knows this exact hazard from Java's own covariant arrays — but Java at least throws `ArrayStoreException` at runtime. TypeScript has no runtime check whatsoever, so the `Cat` simply lands in the `Dog[]` and surfaces as a confusing failure somewhere else entirely.
+
+TypeScript 4.7 added declaration-site variance annotations, but they don't do what wildcards do:
+
+```typescript
+type Getter<out T> = () => T;           // covariant
+type Setter<in T> = (value: T) => void; // contravariant
+interface State<in out T> { ... }       // invariant
+```
+
+These *assert* the variance the checker would otherwise infer structurally — the compiler verifies the annotation is right, and can then skip some structural comparison work. They're an accuracy-and-compile-speed tool aimed at library authors, not a mechanism for a caller to widen or narrow what a function accepts. There is no call-site equivalent of `List<? extends Number>`.
+
+The practical response:
+
+- Use `readonly T[]` (or `ReadonlyArray<T>`) wherever Java would use `List<? extends T>` — read-only-ness is how TypeScript expresses "producer," and it closes the covariance hole for that direction.
+- Don't reach for `in`/`out` to fix an assignability error — they describe variance, they don't change what's assignable at a call site. Check whether `readonly`, or the function-property syntax from §14, is what you actually needed.
+- Treat every implicit widening like `const animals: Animal[] = dogs` as write-unsafe, and don't rely on a runtime error to catch a bad write the way Java's `ArrayStoreException` would.
+- §14 covers the related soundness gap in method-shorthand parameters — same theme, different mechanism.
+
+---
+
 ## What TypeScript Gets Right
 
 The friction above isn't the whole story — several things are genuinely nicer once a Java engineer settles in:
@@ -637,15 +740,19 @@ The friction above isn't the whole story — several things are genuinely nicer 
 This complements — and assumes — the runtime/tooling baseline in [java-to-nodejs](../java-to-nodejs/); the settings below are specifically about getting the most out of the type checker itself.
 
 ```text
-TypeScript:   5.9+
+TypeScript:   7.0+ (the Go-native compiler; still installed as `typescript`, still run as `tsc`)
 Strictness:   strict, plus noUncheckedIndexedAccess and exactOptionalPropertyTypes
+Erasability:  erasableSyntaxOnly — no enum, namespace, or parameter properties
 Enums:        string literal unions + `as const`, not `enum`, for new code
+Resources:    `using` / `await using` for anything with cleanup (§17)
 Decorators:   standard (TC39) decorators for new code; match legacy frameworks explicitly
 Validation:   zod (or equivalent) at any boundary where `unknown` data enters
 Linting:      @typescript-eslint (no-explicit-any, no-unnecessary-condition)
 Declarations: tsc --declaration for anything published as a package
 CI:           tsc --noEmit + eslint + tests, same as java-to-nodejs's baseline
 ```
+
+A note on the version, since the jump is larger than the numbering suggests: TypeScript 6.0 (March 2026) was the last JavaScript-based release, and TypeScript 7.0 (July 2026) is the same compiler ported to Go — roughly 10x faster, with type-checking logic deliberately kept structurally identical, so it enforces the same semantics rather than a new dialect. The package name and the `tsc` binary didn't change (`tsgo` was only the preview-era command name). Two migration details matter: everything 6.0 merely deprecated is a hard error in 7.0, and the programmatic compiler API isn't stable yet — tooling that imports from `typescript` and calls into the compiler directly may not work until 7.1. This guide's examples all assume 5.8+ and hold on any of these releases.
 
 Example `tsconfig.json` additions on top of the java-to-nodejs baseline:
 
@@ -656,7 +763,8 @@ Example `tsconfig.json` additions on top of the java-to-nodejs baseline:
     "noUncheckedIndexedAccess": true,
     "exactOptionalPropertyTypes": true,
     "noImplicitOverride": true,
-    "useUnknownInCatchVariables": true
+    "useUnknownInCatchVariables": true,
+    "erasableSyntaxOnly": true
   }
 }
 ```
@@ -664,6 +772,7 @@ Example `tsconfig.json` additions on top of the java-to-nodejs baseline:
 - `noUncheckedIndexedAccess` makes `arr[i]` return `T | undefined` instead of `T` — without it, an out-of-bounds array or missing map key silently types as present, the closest TypeScript gets to Java's `ArrayIndexOutOfBoundsException`, except without the exception.
 - `exactOptionalPropertyTypes` stops `{ retries?: number }` from silently accepting an explicit `undefined` as equivalent to omitting the field — the two are different in Java (there's no field-omission concept) and this flag makes TypeScript treat them as different too.
 - `useUnknownInCatchVariables` types a caught exception as `unknown` rather than `any` (§4) — since JavaScript's `throw` accepts anything, a `catch` block genuinely doesn't know what it received.
+- `erasableSyntaxOnly` (TypeScript 5.8+) rejects `enum`, `namespace`, and constructor parameter properties (§6) — the only TypeScript constructs that emit runtime code. Turning it on early costs nothing on a codebase already avoiding them, and keeps the door open to running TypeScript directly on a type-stripping runtime.
 
 ## Bottom Line
 

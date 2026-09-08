@@ -41,7 +41,7 @@ The practical response:
 # pyproject.toml
 [tool.pyright]
 typeCheckingMode = "strict"
-pythonVersion = "3.12"
+pythonVersion = "3.13"
 include = ["src"]
 ```
 
@@ -577,6 +577,19 @@ Python refactoring is safe when a team invests in the safety net:
 
 Without that, a renamed keyword argument or removed dictionary field may only surface in an infrequently used runtime path.
 
+One specific gap closed recently: `@typing.override` (PEP 698, Python 3.12+) is the direct analog of Java's `@Override`, and it catches the same refactoring bug — a base-class method renamed while a subclass keeps overriding the old name, silently becoming dead code.
+
+```python
+from typing import override
+
+class AdminUser(User):
+    @override
+    def get_display_name(self) -> str:  # type checker errors if User no longer defines this
+        ...
+```
+
+Like everything else in this section it's checker-enforced rather than language-enforced, so it only helps if the checker actually runs in CI.
+
 A production baseline:
 
 ```bash
@@ -694,6 +707,18 @@ This gives you:
 - Editor autocomplete.
 - Static verification.
 - Safer substitutions and test doubles.
+
+Where Java would reach for a generic bound rather than an interface, Python 3.12+ has syntax that reads much closer to Java's (PEP 695) — type parameters declared inline, no `TypeVar` import and no `Generic` base class:
+
+```python
+def first[T](items: list[T]) -> T:  # Python 3.12+
+    return items[0]
+
+class Repository[T]: ...
+type MaybeUser = User | None
+```
+
+Below the 3.12 floor this is the older `T = TypeVar("T")` plus `Generic[T]` form, which is still valid and still what most existing code looks like. The new form isn't only shorter: its type parameters are properly scoped to the declaration instead of being module-level variables, and variance is inferred rather than declared.
 
 ---
 
@@ -815,6 +840,19 @@ The practical response, on the default (GIL) build:
 - Use `asyncio` for high-concurrency IO-bound workloads, where cooperative scheduling replaces Java's thread-per-request model.
 - Since 3.14, `concurrent.interpreters` (PEP 734) offers a fourth option: multiple isolated interpreters in one process, each with its own GIL. It gives process-like isolation without the pickling/IPC cost of `multiprocessing` — useful for CPU-bound work that needs isolation but not a separate OS process.
 - On the free-threaded build, `threading` becomes viable for CPU-bound work too, once you've confirmed your dependencies are free-threading-safe.
+
+One trap worth knowing before you reach for `asyncio.TaskGroup`: when concurrent tasks fail, they fail *together*. A `TaskGroup` raises `ExceptionGroup` (Python 3.11+), and an ordinary `except` clause does not match the exceptions wrapped inside it — you need `except*`:
+
+```python
+try:
+    async with asyncio.TaskGroup() as tg:
+        tg.create_task(fetch_user())
+        tg.create_task(fetch_orders())
+except* ValueError as eg:      # matches ValueErrors *inside* the group
+    handle(eg.exceptions)
+```
+
+Writing `except ValueError` here silently fails to catch anything, because the raised object is an `ExceptionGroup`, not a `ValueError`. Java has no equivalent construct — its structured concurrency proposal surfaces the first failure and cancels the rest, rather than handing you a tree of concurrent failures to destructure.
 
 A Java developer coming from JDK 21 or later, used to virtual threads — write blocking-style code, get async-style scalability for free — will notice `asyncio` requires explicit `async`/`await` coloring through the whole call stack; there is no equivalent that hides the concurrency model from calling code. (A JDK 17 developer won't have that comparison point at all — virtual threads finalized in JDK 21. And Java's own structured concurrency, the piece that would pair with virtual threads the way `asyncio.TaskGroup` pairs with `asyncio`, is still in preview as of JDK 27 — JEP 533, seventh preview, with finalization now targeted for JDK 28 — so it isn't a stable comparison to lean on yet either.)
 
@@ -1048,6 +1086,15 @@ The practical response:
 - Use `json` or a Pydantic model (§6, §12) for anything crossing a trust boundary.
 - Reserve `pickle` for trusted, internal-only use — e.g., caching an object between processes you control.
 
+The adjacent trust-boundary problem is interpolation. An f-string builds a finished string with no record of which parts came from user input, so `f"SELECT * FROM users WHERE id = {user_id}"` is the SQL-injection shape a Java developer avoids with `PreparedStatement`. Template strings (PEP 750, Python 3.14+) add a `t` prefix that produces a `Template` object instead of a `str`, keeping static text and interpolated values separate so a library can escape or parameterize them before assembly:
+
+```python
+query = t"SELECT * FROM users WHERE id = {user_id}"
+type(query)  # string.templatelib.Template — not a str, so it can't be executed by accident
+```
+
+This is new enough that library support is still arriving; parameterized queries through your database driver remain the answer today. Its value for a Java developer is structural — a t-string can't be passed where a finished `str` is required, which is exactly the property `PreparedStatement` relies on.
+
 ---
 
 ## 23. “Where is the Javadoc equivalent?”
@@ -1181,6 +1228,82 @@ The practical response:
 
 ---
 
+## 26. “Why did this type annotation crash at import time?”
+
+In Java, a type in a signature is resolved by the compiler across the whole compilation unit before any code runs, so a class referring to itself is unremarkable:
+
+```java
+class Node {
+    Node parent;
+    Node addChild(Node child) { ... } // referring to Node inside Node is fine
+}
+```
+
+A Python annotation is not metadata the way a Java annotation is — it's an ordinary expression, and through Python 3.13 it was evaluated eagerly, at the moment the `def` or `class` statement executed:
+
+```python
+class Node:
+    def add_child(self, child: Node) -> Node:  # NameError on 3.13 and earlier —
+        ...                                     # Node doesn't exist yet while its own body runs
+```
+
+Two workarounds grew up around this. Quoting the name (`-> "Node"`) defers it to a string, which is why quoted forward references appear throughout typed Python — including in §7 of this guide. The broader fix, `from __future__ import annotations` (PEP 563), stringified *every* annotation in the module, which solved import-time crashes but broke the libraries that read annotations at runtime — Pydantic, dataclasses, FastAPI — since they now received strings where they expected type objects.
+
+Python 3.14 changes the default. Under PEP 649 (implemented via PEP 749), annotations are stored in a lazily-evaluated function and computed only on first access, so forward references resolve without quoting and without stringifying anything:
+
+```python
+# Python 3.14+
+class Node:
+    def add_child(self, child: Node) -> Node:  # fine — not evaluated at class-definition time
+        ...
+
+from annotationlib import get_annotations, Format
+
+get_annotations(Node.add_child, format=Format.VALUE)      # real objects, may raise NameError
+get_annotations(Node.add_child, format=Format.FORWARDREF) # unresolved names become ForwardRef
+get_annotations(Node.add_child, format=Format.STRING)     # annotations as strings
+```
+
+The practical response:
+
+- On 3.14+, stop adding `from __future__ import annotations` to new modules — forward references work unquoted. The import still behaves as it always did, so existing modules don't need an urgent migration.
+- At this guide's 3.10 floor you still need one of the two workarounds. Prefer quoting individual forward references over the module-wide `__future__` import, precisely because the latter is the one that surprises runtime consumers.
+- If you write code that *reads* annotations — a DI container, a serializer, the kind of thing you'd do with reflection in Java — use `annotationlib.get_annotations()` with an explicit format rather than reaching into `__annotations__`, which now means different things on different versions.
+- Remember that annotations are executable expressions in a way Java's never are: an expensive or side-effecting annotation is real code, and before 3.14 it ran at import.
+
+---
+
+## 27. “Why is this ten times slower than the equivalent Java?”
+
+A hot loop in Java is interpreted briefly, then compiled to native code by HotSpot's tiered JIT, with inlining and loop optimizations applied:
+
+```java
+long total = 0;
+for (int i = 0; i < 50_000_000; i++) {
+    total += i; // C2 compiles this to tight machine code once it runs hot
+}
+```
+
+The same loop in CPython runs through the bytecode interpreter on every single iteration, and the default build has no optimizing JIT to graduate it to native code:
+
+```python
+total = 0
+for i in range(50_000_000):
+    total += i  # seconds, not milliseconds
+```
+
+The gap is real, but it has been narrowing. Python 3.11 shipped the specializing adaptive interpreter (PEP 659), which rewrites hot bytecodes into type-specialized variants — conceptually similar to a JIT's inline caches, though still interpretation rather than native code — and measured about 1.25x faster than 3.10 across the pyperformance suite. Python 3.13 added an experimental copy-and-patch JIT (PEP 744), disabled by default; as of 3.14 it remains experimental, though the official Windows and macOS binaries now ship with support for it compiled in.
+
+The practical response:
+
+- Don't port a hot numeric loop line-by-line from Java and expect the JIT to rescue it. The Python answer is to stop executing Python bytecode in the loop at all — push it into NumPy, Polars, or a native extension. That's an architectural difference, not a tuning exercise.
+- Measure before optimizing: for the IO-bound service code that makes up most backends, interpreter speed is rarely the bottleneck, and the network dominates.
+- Don't enable the experimental JIT in production expecting HotSpot-like gains — it's off by default and still experimental as of 3.14, with no stability guarantees.
+- Keep the interpreter floor moving. Version upgrades have delivered real single-threaded gains recently, in a way that was not true across the 3.x releases a Java developer may remember.
+- Single-threaded speed and multi-core scaling are separate problems — §16 covers the GIL and the free-threaded build, which on 3.14 costs roughly 5–10% single-threaded to buy real parallelism.
+
+---
+
 ## What Python Gets Right
 
 The friction above shouldn't read as "Python is worse." Several things are genuinely nicer once a Java engineer settles in:
@@ -1199,8 +1322,10 @@ None of this replaces the discipline this guide argues for — it's why that dis
 
 For production backend, API-platform, cloud, and AI-agent services:
 
+Python has no LTS, so the practical equivalent of a Java team's LTS discipline is "current stable, minus one, once your wheels are ready." Python 3.14 is the current stable release; the pins below sit one release back, which is the conservative choice for dependency and wheel availability. Move to 3.14 deliberately when you want PEP 649 annotation semantics (§26), t-strings (§22), or the officially supported free-threaded build (§16).
+
 ```text
-Python:       Python 3.12+
+Python:       Python 3.13+
 Packages:     uv + pyproject.toml + lock file
 Formatting:   Ruff format
 Linting:      Ruff check
@@ -1221,7 +1346,7 @@ Example `pyproject.toml`:
 [project]
 name = "api-service"
 version = "0.1.0"
-requires-python = ">=3.12"
+requires-python = ">=3.13"
 dependencies = [
   "fastapi>=0.115",
   "pydantic>=2.0",
@@ -1239,11 +1364,11 @@ dev = [
 
 [tool.pyright]
 typeCheckingMode = "strict"
-pythonVersion = "3.12"
+pythonVersion = "3.13"
 include = ["src"]
 
 [tool.ruff]
-target-version = "py312"
+target-version = "py313"
 line-length = 100
 
 [tool.pytest.ini_options]
@@ -1271,7 +1396,7 @@ jobs:
 
       - uses: astral-sh/setup-uv@v5
 
-      - run: uv python install 3.12
+      - run: uv python install 3.13
       - run: uv sync --locked
       - run: uv run ruff format --check .
       - run: uv run ruff check .
